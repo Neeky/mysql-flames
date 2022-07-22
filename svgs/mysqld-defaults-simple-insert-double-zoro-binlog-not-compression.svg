@@ -1,0 +1,3304 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="966" onload="init(evt)" viewBox="0 0 1200 966" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#f8f8f8" offset="5%" />
+		<stop stop-color="#e8e8e8" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				clearzoom();
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="966.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >mysqld-defaults-simple-insert-double-zoro-binlog-not-compression</text>
+<text id="details" x="10.00" y="949" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="949" > </text>
+<g id="frames">
+<g >
+<title>tcp_skb_entail (1 samples, 0.39%)</title><rect x="579.5" y="389" width="4.6" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="582.50" y="399.5" ></text>
+</g>
+<g >
+<title>vfs_write (4 samples, 1.54%)</title><rect x="246.9" y="693" width="18.2" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="249.91" y="703.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (10 samples, 3.86%)</title><rect x="916.6" y="613" width="45.6" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="919.64" y="623.5" >do_s..</text>
+</g>
+<g >
+<title>fsp_is_global_temporary(unsigned int) (1 samples, 0.39%)</title><rect x="1048.8" y="581" width="4.5" height="15.0" fill="rgb(67,180,180)" rx="2" ry="2" />
+<text  x="1051.76" y="591.5" ></text>
+</g>
+<g >
+<title>memset (1 samples, 0.39%)</title><rect x="948.5" y="405" width="4.6" height="15.0" fill="rgb(91,203,203)" rx="2" ry="2" />
+<text  x="951.53" y="415.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 0.39%)</title><rect x="210.5" y="645" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="213.46" y="655.5" ></text>
+</g>
+<g >
+<title>blk_mq_sched_dispatch_requests (16 samples, 6.18%)</title><rect x="37.3" y="629" width="72.9" height="15.0" fill="rgb(68,181,181)" rx="2" ry="2" />
+<text  x="40.34" y="639.5" >blk_mq_s..</text>
+</g>
+<g >
+<title>evp_EncryptDecryptUpdate (1 samples, 0.39%)</title><rect x="597.7" y="581" width="4.6" height="15.0" fill="rgb(90,202,202)" rx="2" ry="2" />
+<text  x="600.72" y="591.5" ></text>
+</g>
+<g >
+<title>ssl3_read_internal (16 samples, 6.18%)</title><rect x="324.4" y="677" width="72.9" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="327.36" y="687.5" >ssl3_rea..</text>
+</g>
+<g >
+<title>ext4_sync_file (1 samples, 0.39%)</title><rect x="283.4" y="661" width="4.5" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="286.36" y="671.5" ></text>
+</g>
+<g >
+<title>LEX::make_sql_cmd(Parse_tree_root*) (4 samples, 1.54%)</title><rect x="1117.1" y="757" width="18.2" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="1120.10" y="767.5" ></text>
+</g>
+<g >
+<title>THD::binlog_write_table_map(TABLE*, bool, bool) (2 samples, 0.77%)</title><rect x="739.0" y="693" width="9.1" height="15.0" fill="rgb(78,190,190)" rx="2" ry="2" />
+<text  x="741.96" y="703.5" ></text>
+</g>
+<g >
+<title>Rpl_thd_context::set_tx_rpl_delegate_stage_status(Rpl_thd_context::enum_transaction_rpl_delegate_status) (2 samples, 0.77%)</title><rect x="871.1" y="757" width="9.1" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="874.08" y="767.5" ></text>
+</g>
+<g >
+<title>bwrite_conv (29 samples, 11.20%)</title><rect x="465.6" y="581" width="132.1" height="15.0" fill="rgb(88,199,199)" rx="2" ry="2" />
+<text  x="468.60" y="591.5" >bwrite_conv</text>
+</g>
+<g >
+<title>EVP_DecryptFinal_ex (1 samples, 0.39%)</title><rect x="379.0" y="597" width="4.6" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="382.03" y="607.5" ></text>
+</g>
+<g >
+<title>loopback_xmit (1 samples, 0.39%)</title><rect x="479.3" y="293" width="4.5" height="15.0" fill="rgb(105,215,215)" rx="2" ry="2" />
+<text  x="482.27" y="303.5" ></text>
+</g>
+<g >
+<title>os_file_write_func(IORequest&amp;, char const*, int, void const*, unsigned long, unsigned long) (5 samples, 1.93%)</title><rect x="183.1" y="693" width="22.8" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="186.13" y="703.5" >o..</text>
+</g>
+<g >
+<title>__blk_mq_sched_dispatch_requests (4 samples, 1.54%)</title><rect x="183.1" y="405" width="18.3" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="186.13" y="415.5" ></text>
+</g>
+<g >
+<title>Table_map_log_event::Table_map_log_event(THD*, TABLE*, Table_id const&amp;, bool) (1 samples, 0.39%)</title><rect x="743.5" y="677" width="4.6" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="746.51" y="687.5" ></text>
+</g>
+<g >
+<title>os_file_write_retry(IORequest&amp;, char const*, pfs_os_file_t, void const*, unsigned long, unsigned long) (5 samples, 1.93%)</title><rect x="183.1" y="709" width="22.8" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="186.13" y="719.5" >o..</text>
+</g>
+<g >
+<title>string2decimal(char const*, decimal_t*, char const**) (1 samples, 0.39%)</title><rect x="1144.4" y="709" width="4.6" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="1147.44" y="719.5" ></text>
+</g>
+<g >
+<title>pagecache_get_page (1 samples, 0.39%)</title><rect x="944.0" y="485" width="4.5" height="15.0" fill="rgb(79,191,191)" rx="2" ry="2" />
+<text  x="946.98" y="495.5" ></text>
+</g>
+<g >
+<title>mtr_t::Command::add_dirty_blocks_to_flush_list(unsigned long, unsigned long) (1 samples, 0.39%)</title><rect x="985.0" y="565" width="4.5" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="987.98" y="575.5" ></text>
+</g>
+<g >
+<title>Rpl_transaction_write_set_ctx::add_write_set(unsigned long) (1 samples, 0.39%)</title><rect x="752.6" y="677" width="4.6" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="755.63" y="687.5" ></text>
+</g>
+<g >
+<title>__do_softirq (15 samples, 5.79%)</title><rect x="483.8" y="293" width="68.4" height="15.0" fill="rgb(106,217,217)" rx="2" ry="2" />
+<text  x="486.82" y="303.5" >__do_so..</text>
+</g>
+<g >
+<title>blk_flush_plug (16 samples, 6.18%)</title><rect x="37.3" y="709" width="72.9" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="40.34" y="719.5" >blk_flus..</text>
+</g>
+<g >
+<title>iomap_dio_rw (5 samples, 1.93%)</title><rect x="183.1" y="549" width="22.8" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="186.13" y="559.5" >i..</text>
+</g>
+<g >
+<title>Clone_persist_gtid::write_to_table(unsigned long, Gtid_set&amp;, Sid_map&amp;) (2 samples, 0.77%)</title><rect x="224.1" y="821" width="9.1" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="227.13" y="831.5" ></text>
+</g>
+<g >
+<title>selinux_ip_postroute_compat (1 samples, 0.39%)</title><rect x="561.3" y="293" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="564.27" y="303.5" ></text>
+</g>
+<g >
+<title>ext4_do_update_inode.isra.0 (2 samples, 0.77%)</title><rect x="921.2" y="437" width="9.1" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="924.20" y="447.5" ></text>
+</g>
+<g >
+<title>buf_page_get_gen(page_id_t const&amp;, page_size_t const&amp;, unsigned long, buf_block_t*, Page_fetch, ut::Location, mtr_t*, bool) (1 samples, 0.39%)</title><rect x="1098.9" y="661" width="4.5" height="15.0" fill="rgb(91,202,202)" rx="2" ry="2" />
+<text  x="1101.88" y="671.5" ></text>
+</g>
+<g >
+<title>handler::ha_write_row(unsigned char*) (1 samples, 0.39%)</title><rect x="228.7" y="757" width="4.5" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="231.69" y="767.5" ></text>
+</g>
+<g >
+<title>Owned_gtids::add_gtid_owner(Gtid const&amp;, unsigned int) (1 samples, 0.39%)</title><rect x="1062.4" y="645" width="4.6" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="1065.43" y="655.5" ></text>
+</g>
+<g >
+<title>binlog::monitoring::Compression_stats::add(std::string, unsigned long, unsigned long, unsigned long) (1 samples, 0.39%)</title><rect x="1076.1" y="629" width="4.6" height="15.0" fill="rgb(59,174,174)" rx="2" ry="2" />
+<text  x="1079.10" y="639.5" ></text>
+</g>
+<g >
+<title>file_update_time (3 samples, 1.16%)</title><rect x="916.6" y="533" width="13.7" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="919.64" y="543.5" ></text>
+</g>
+<g >
+<title>kmem_cache_alloc (1 samples, 0.39%)</title><rect x="256.0" y="549" width="4.6" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="259.02" y="559.5" ></text>
+</g>
+<g >
+<title>wake_up_q (8 samples, 3.09%)</title><rect x="114.8" y="789" width="36.4" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="117.79" y="799.5" >wak..</text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::process_commit_stage_queue(THD*, THD*) (21 samples, 8.11%)</title><rect x="966.8" y="709" width="95.6" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="969.76" y="719.5" >MYSQL_BIN_L..</text>
+</g>
+<g >
+<title>syscall (19 samples, 7.34%)</title><rect x="28.2" y="869" width="86.6" height="15.0" fill="rgb(56,170,170)" rx="2" ry="2" />
+<text  x="31.22" y="879.5" >syscall</text>
+</g>
+<g >
+<title>Sid_map::add_sid(binary_log::Uuid const&amp;) (1 samples, 0.39%)</title><rect x="224.1" y="789" width="4.6" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="227.13" y="799.5" ></text>
+</g>
+<g >
+<title>ext4_buffered_write_iter (10 samples, 3.86%)</title><rect x="916.6" y="549" width="45.6" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="919.64" y="559.5" >ext4..</text>
+</g>
+<g >
+<title>blk_mq_dispatch_rq_list (1 samples, 0.39%)</title><rect x="37.3" y="565" width="4.6" height="15.0" fill="rgb(74,187,187)" rx="2" ry="2" />
+<text  x="40.34" y="575.5" ></text>
+</g>
+<g >
+<title>my_b_flush_io_cache(IO_CACHE*, int) (10 samples, 3.86%)</title><rect x="916.6" y="677" width="45.6" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="919.64" y="687.5" >my_b..</text>
+</g>
+<g >
+<title>net_read_packet(NET*, unsigned long*) (20 samples, 7.72%)</title><rect x="324.4" y="773" width="91.1" height="15.0" fill="rgb(98,209,209)" rx="2" ry="2" />
+<text  x="327.36" y="783.5" >net_read_p..</text>
+</g>
+<g >
+<title>find_field_in_tables(THD*, Item_ident*, TABLE_LIST*, TABLE_LIST*, Item**, find_item_error_report_type, unsigned long, bool) (1 samples, 0.39%)</title><rect x="656.9" y="677" width="4.6" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="659.95" y="687.5" ></text>
+</g>
+<g >
+<title>mtr_t::commit() (1 samples, 0.39%)</title><rect x="821.0" y="629" width="4.5" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="823.97" y="639.5" ></text>
+</g>
+<g >
+<title>generic_write_check_limits (1 samples, 0.39%)</title><rect x="246.9" y="613" width="4.6" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="249.91" y="623.5" ></text>
+</g>
+<g >
+<title>Buf_fetch&lt;Buf_fetch_normal&gt;::single_page() (1 samples, 0.39%)</title><rect x="1016.9" y="533" width="4.5" height="15.0" fill="rgb(55,170,170)" rx="2" ry="2" />
+<text  x="1019.87" y="543.5" ></text>
+</g>
+<g >
+<title>ha_innobase::update_thd(THD*) (1 samples, 0.39%)</title><rect x="862.0" y="725" width="4.5" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="864.97" y="735.5" ></text>
+</g>
+<g >
+<title>trx_undo_update_cleanup(trx_t*, trx_undo_ptr_t*, unsigned char*, bool, unsigned long, mtr_t*) (6 samples, 2.32%)</title><rect x="1012.3" y="581" width="27.4" height="15.0" fill="rgb(56,171,171)" rx="2" ry="2" />
+<text  x="1015.32" y="591.5" >t..</text>
+</g>
+<g >
+<title>Clone_persist_gtid::has_gtid(trx_t*, THD*&amp;, bool&amp;) (1 samples, 0.39%)</title><rect x="1039.7" y="597" width="4.5" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="1042.65" y="607.5" ></text>
+</g>
+<g >
+<title>security_sock_rcv_skb (1 samples, 0.39%)</title><rect x="488.4" y="133" width="4.5" height="15.0" fill="rgb(101,211,211)" rx="2" ry="2" />
+<text  x="491.38" y="143.5" ></text>
+</g>
+<g >
+<title>fil_redo_io(IORequest const&amp;, page_id_t const&amp;, page_size_t const&amp;, unsigned long, unsigned long, void*) (6 samples, 2.32%)</title><rect x="242.4" y="821" width="27.3" height="15.0" fill="rgb(68,182,182)" rx="2" ry="2" />
+<text  x="245.36" y="831.5" >f..</text>
+</g>
+<g >
+<title>parse_sql(THD*, Parser_state*, Object_creation_ctx*) (13 samples, 5.02%)</title><rect x="1117.1" y="789" width="59.2" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="1120.10" y="799.5" >parse_..</text>
+</g>
+<g >
+<title>plugin_lock(THD*, st_plugin_int**) (1 samples, 0.39%)</title><rect x="884.7" y="741" width="4.6" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="887.75" y="751.5" ></text>
+</g>
+<g >
+<title>net_flush(NET*) (40 samples, 15.44%)</title><rect x="429.2" y="757" width="182.2" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="432.15" y="767.5" >net_flush(NET*)</text>
+</g>
+<g >
+<title>operator delete(void*) (1 samples, 0.39%)</title><rect x="698.0" y="693" width="4.5" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="700.95" y="703.5" ></text>
+</g>
+<g >
+<title>__x64_sys_io_getevents (1 samples, 0.39%)</title><rect x="28.2" y="821" width="4.6" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="31.22" y="831.5" ></text>
+</g>
+<g >
+<title>CRYPTO_free (1 samples, 0.39%)</title><rect x="388.1" y="581" width="4.6" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="391.15" y="591.5" ></text>
+</g>
+<g >
+<title>setup_fields(THD*, unsigned long, bool, bool, bool, mem_root_deque&lt;Item*&gt; const*, mem_root_deque&lt;Item*&gt;*, Bounds_checked_array&lt;Item*&gt;) (2 samples, 0.77%)</title><rect x="652.4" y="709" width="9.1" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="655.39" y="719.5" ></text>
+</g>
+<g >
+<title>selinux_ipv4_postroute (1 samples, 0.39%)</title><rect x="565.8" y="293" width="4.6" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="568.83" y="303.5" ></text>
+</g>
+<g >
+<title>file_update_time (2 samples, 0.77%)</title><rect x="251.5" y="645" width="9.1" height="15.0" fill="rgb(65,178,178)" rx="2" ry="2" />
+<text  x="254.47" y="655.5" ></text>
+</g>
+<g >
+<title>trx_undo_set_state_at_prepare(trx_t*, trx_undo_t*, bool, mtr_t*) (3 samples, 1.16%)</title><rect x="1094.3" y="677" width="13.7" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="1097.32" y="687.5" ></text>
+</g>
+<g >
+<title>__blk_mq_do_dispatch_sched (16 samples, 6.18%)</title><rect x="37.3" y="597" width="72.9" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="40.34" y="607.5" >__blk_mq..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (28 samples, 10.81%)</title><rect x="470.2" y="549" width="127.5" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="473.15" y="559.5" >entry_SYSCALL_64..</text>
+</g>
+<g >
+<title>__GI_fsync (3 samples, 1.16%)</title><rect x="274.2" y="741" width="13.7" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="277.25" y="751.5" ></text>
+</g>
+<g >
+<title>Sql_cmd_dml::execute(THD*) (48 samples, 18.53%)</title><rect x="638.7" y="773" width="218.7" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="641.73" y="783.5" >Sql_cmd_dml::execute(THD*)</text>
+</g>
+<g >
+<title>Field_real::truncate(double*, double) (1 samples, 0.39%)</title><rect x="711.6" y="677" width="4.6" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="714.62" y="687.5" ></text>
+</g>
+<g >
+<title>page_cur_search_with_match(buf_block_t const*, dict_index_t const*, dtuple_t const*, page_cur_mode_t, unsigned long*, unsigned long*, page_cur_t*, rtr_info*) (1 samples, 0.39%)</title><rect x="802.7" y="613" width="4.6" height="15.0" fill="rgb(67,180,180)" rx="2" ry="2" />
+<text  x="805.74" y="623.5" ></text>
+</g>
+<g >
+<title>ssl3_get_record (14 samples, 5.41%)</title><rect x="328.9" y="645" width="63.8" height="15.0" fill="rgb(54,168,168)" rx="2" ry="2" />
+<text  x="331.92" y="655.5" >ssl3_ge..</text>
+</g>
+<g >
+<title>syscall_exit_work (1 samples, 0.39%)</title><rect x="265.1" y="677" width="4.6" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="268.14" y="687.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (6 samples, 2.32%)</title><rect x="351.7" y="533" width="27.3" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="354.70" y="543.5" >d..</text>
+</g>
+<g >
+<title>btr_page_split_and_insert(unsigned int, btr_cur_t*, unsigned long**, mem_block_info_t**, dtuple_t const*, mtr_t*) (1 samples, 0.39%)</title><rect x="789.1" y="613" width="4.5" height="15.0" fill="rgb(106,217,217)" rx="2" ry="2" />
+<text  x="792.07" y="623.5" ></text>
+</g>
+<g >
+<title>lock_rec_insert_check_and_lock(unsigned long, unsigned char const*, buf_block_t*, dict_index_t*, que_thr_t*, mtr_t*, bool*) (1 samples, 0.39%)</title><rect x="761.7" y="613" width="4.6" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="764.74" y="623.5" ></text>
+</g>
+<g >
+<title>my_strtod(char const*, char const**, int*) (1 samples, 0.39%)</title><rect x="716.2" y="661" width="4.5" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="719.18" y="671.5" ></text>
+</g>
+<g >
+<title>syscall (1 samples, 0.39%)</title><rect x="825.5" y="677" width="4.6" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="828.52" y="687.5" ></text>
+</g>
+<g >
+<title>trans_commit(THD*, bool) (47 samples, 18.15%)</title><rect x="893.9" y="773" width="214.1" height="15.0" fill="rgb(77,189,189)" rx="2" ry="2" />
+<text  x="896.86" y="783.5" >trans_commit(THD*, bool)</text>
+</g>
+<g >
+<title>__ext4_journal_start_sb (1 samples, 0.39%)</title><rect x="948.5" y="469" width="4.6" height="15.0" fill="rgb(55,170,170)" rx="2" ry="2" />
+<text  x="951.53" y="479.5" ></text>
+</g>
+<g >
+<title>ip_output (3 samples, 1.16%)</title><rect x="556.7" y="341" width="13.7" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="559.72" y="351.5" ></text>
+</g>
+<g >
+<title>binlog_cache_data::write_event(Log_event*) (1 samples, 0.39%)</title><rect x="702.5" y="709" width="4.6" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="705.51" y="719.5" ></text>
+</g>
+<g >
+<title>aio_write (17 samples, 6.56%)</title><rect x="32.8" y="789" width="77.4" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="35.78" y="799.5" >aio_write</text>
+</g>
+<g >
+<title>[unknown] (1 samples, 0.39%)</title><rect x="10.0" y="869" width="4.6" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="13.00" y="879.5" ></text>
+</g>
+<g >
+<title>__lll_lock_wake (1 samples, 0.39%)</title><rect x="306.1" y="789" width="4.6" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="309.14" y="799.5" ></text>
+</g>
+<g >
+<title>memcg_slab_free_hook (1 samples, 0.39%)</title><rect x="543.1" y="37" width="4.5" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="546.05" y="47.5" ></text>
+</g>
+<g >
+<title>vfs_read (4 samples, 1.54%)</title><rect x="360.8" y="501" width="18.2" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="363.81" y="511.5" ></text>
+</g>
+<g >
+<title>buf_page_get_gen(page_id_t const&amp;, page_size_t const&amp;, unsigned long, buf_block_t*, Page_fetch, ut::Location, mtr_t*, bool) (1 samples, 0.39%)</title><rect x="798.2" y="613" width="4.5" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="801.19" y="623.5" ></text>
+</g>
+<g >
+<title>Protocol_classic::send_ok(unsigned int, unsigned int, unsigned long long, unsigned long long, char const*) (41 samples, 15.83%)</title><rect x="429.2" y="789" width="186.7" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="432.15" y="799.5" >Protocol_classic::send_o..</text>
+</g>
+<g >
+<title>iov_iter_fault_in_readable (1 samples, 0.39%)</title><rect x="957.6" y="517" width="4.6" height="15.0" fill="rgb(59,174,174)" rx="2" ry="2" />
+<text  x="960.64" y="527.5" ></text>
+</g>
+<g >
+<title>vp_notify (4 samples, 1.54%)</title><rect x="183.1" y="325" width="18.3" height="15.0" fill="rgb(66,179,179)" rx="2" ry="2" />
+<text  x="186.13" y="335.5" ></text>
+</g>
+<g >
+<title>row_insert_for_mysql_using_ins_graph(unsigned char const*, row_prebuilt_t*) (16 samples, 6.18%)</title><rect x="757.2" y="693" width="72.9" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="760.18" y="703.5" >row_inse..</text>
+</g>
+<g >
+<title>fill_record_n_invoke_before_triggers(THD*, COPY_INFO*, mem_root_deque&lt;Item*&gt; const&amp;, mem_root_deque&lt;Item*&gt; const&amp;, TABLE*, enum_trigger_event_type, int, bool, bool*) (3 samples, 1.16%)</title><rect x="707.1" y="741" width="13.6" height="15.0" fill="rgb(55,169,169)" rx="2" ry="2" />
+<text  x="710.07" y="751.5" ></text>
+</g>
+<g >
+<title>Buf_fetch_normal::get(buf_block_t*&amp;) (1 samples, 0.39%)</title><rect x="798.2" y="581" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="801.19" y="591.5" ></text>
+</g>
+<g >
+<title>dblwr::write(buf_flush_t, buf_page_t*, bool) (8 samples, 3.09%)</title><rect x="178.6" y="773" width="36.4" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="181.57" y="783.5" >dbl..</text>
+</g>
+<g >
+<title>virtqueue_notify (4 samples, 1.54%)</title><rect x="183.1" y="341" width="18.3" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="186.13" y="351.5" ></text>
+</g>
+<g >
+<title>Gtid_state::update_commit_group(THD*) (1 samples, 0.39%)</title><rect x="966.8" y="693" width="4.5" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="969.76" y="703.5" ></text>
+</g>
+<g >
+<title>iowrite16 (13 samples, 5.02%)</title><rect x="51.0" y="517" width="59.2" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="54.00" y="527.5" >iowrit..</text>
+</g>
+<g >
+<title>row_ins_clust_index_entry(dict_index_t*, dtuple_t*, que_thr_t*, bool) (15 samples, 5.79%)</title><rect x="757.2" y="661" width="68.3" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="760.18" y="671.5" >row_ins..</text>
+</g>
+<g >
+<title>lock_rec_get_first_on_page_addr(hash_table_t*, page_id_t const&amp;) (1 samples, 0.39%)</title><rect x="761.7" y="597" width="4.6" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="764.74" y="607.5" ></text>
+</g>
+<g >
+<title>_raw_read_lock (1 samples, 0.39%)</title><rect x="32.8" y="725" width="4.5" height="15.0" fill="rgb(77,189,189)" rx="2" ry="2" />
+<text  x="35.78" y="735.5" ></text>
+</g>
+<g >
+<title>SSL_write (38 samples, 14.67%)</title><rect x="438.3" y="709" width="173.1" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="441.26" y="719.5" >SSL_write</text>
+</g>
+<g >
+<title>THD::cleanup_after_query() (1 samples, 0.39%)</title><rect x="615.9" y="789" width="4.6" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="618.95" y="799.5" ></text>
+</g>
+<g >
+<title>submit_bio_noacct (1 samples, 0.39%)</title><rect x="278.8" y="629" width="4.6" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="281.80" y="639.5" ></text>
+</g>
+<g >
+<title>lock_tables(THD*, TABLE_LIST*, unsigned int, unsigned int) (4 samples, 1.54%)</title><rect x="834.6" y="757" width="18.3" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="837.63" y="767.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock_irq (1 samples, 0.39%)</title><rect x="278.8" y="581" width="4.6" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="281.80" y="591.5" ></text>
+</g>
+<g >
+<title>plugin_foreach_with_mask(THD*, bool (**)(THD*, st_plugin_int*, void*), int, unsigned int, void*) (1 samples, 0.39%)</title><rect x="1085.2" y="693" width="4.6" height="15.0" fill="rgb(89,200,200)" rx="2" ry="2" />
+<text  x="1088.21" y="703.5" ></text>
+</g>
+<g >
+<title>iomap_dio_rw (16 samples, 6.18%)</title><rect x="37.3" y="757" width="72.9" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="40.34" y="767.5" >iomap_di..</text>
+</g>
+<g >
+<title>Log_event::write(Basic_ostream*) (1 samples, 0.39%)</title><rect x="739.0" y="677" width="4.5" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="741.96" y="687.5" ></text>
+</g>
+<g >
+<title>crc32c_pcl_intel_update (1 samples, 0.39%)</title><rect x="925.8" y="357" width="4.5" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="928.75" y="367.5" ></text>
+</g>
+<g >
+<title>futex_wake (1 samples, 0.39%)</title><rect x="306.1" y="709" width="4.6" height="15.0" fill="rgb(56,170,170)" rx="2" ry="2" />
+<text  x="309.14" y="719.5" ></text>
+</g>
+<g >
+<title>os_aio_func(IORequest&amp;, AIO_mode, char const*, pfs_os_file_t, void*, unsigned long, unsigned long, bool, fil_node_t*, void*) (2 samples, 0.77%)</title><rect x="205.9" y="677" width="9.1" height="15.0" fill="rgb(102,213,213)" rx="2" ry="2" />
+<text  x="208.91" y="687.5" ></text>
+</g>
+<g >
+<title>ext4_dio_write_iter (17 samples, 6.56%)</title><rect x="32.8" y="773" width="77.4" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="35.78" y="783.5" >ext4_dio..</text>
+</g>
+<g >
+<title>ext4_sync_file (2 samples, 0.77%)</title><rect x="278.8" y="677" width="9.1" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="281.80" y="687.5" ></text>
+</g>
+<g >
+<title>trx_release_impl_and_expl_locks(trx_t*, bool) (4 samples, 1.54%)</title><rect x="989.5" y="597" width="18.3" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="992.54" y="607.5" ></text>
+</g>
+<g >
+<title>syscall_exit_work (1 samples, 0.39%)</title><rect x="265.1" y="693" width="4.6" height="15.0" fill="rgb(82,195,195)" rx="2" ry="2" />
+<text  x="268.14" y="703.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2 samples, 0.77%)</title><rect x="278.8" y="725" width="9.1" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="281.80" y="735.5" ></text>
+</g>
+<g >
+<title>binlog_log_row(TABLE*, unsigned char const*, unsigned char const*, bool (*)(THD*, TABLE*, bool, unsigned char const*, unsigned char const*)) (6 samples, 2.32%)</title><rect x="729.8" y="709" width="27.4" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="732.85" y="719.5" >b..</text>
+</g>
+<g >
+<title>schedule (3 samples, 1.16%)</title><rect x="164.9" y="773" width="13.7" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="167.90" y="783.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (5 samples, 1.93%)</title><rect x="183.1" y="629" width="22.8" height="15.0" fill="rgb(98,209,209)" rx="2" ry="2" />
+<text  x="186.13" y="639.5" >d..</text>
+</g>
+<g >
+<title>Fil_shard::space_flush(unsigned int) (3 samples, 1.16%)</title><rect x="274.2" y="757" width="13.7" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="277.25" y="767.5" ></text>
+</g>
+<g >
+<title>Item::save_in_field(Field*, bool) (3 samples, 1.16%)</title><rect x="707.1" y="709" width="13.6" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="710.07" y="719.5" ></text>
+</g>
+<g >
+<title>Field::set_notnull(long) (1 samples, 0.39%)</title><rect x="707.1" y="693" width="4.5" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="710.07" y="703.5" ></text>
+</g>
+<g >
+<title>PolicyMutex&lt;TTASEventMutex&lt;GenericPolicy&gt; &gt;::exit() (1 samples, 0.39%)</title><rect x="1003.2" y="565" width="4.6" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="1006.20" y="575.5" ></text>
+</g>
+<g >
+<title>std::string::assign(std::string const&amp;) (1 samples, 0.39%)</title><rect x="1076.1" y="613" width="4.6" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="1079.10" y="623.5" ></text>
+</g>
+<g >
+<title>buf_page_hash_get_low(buf_pool_t*, page_id_t const&amp;) (1 samples, 0.39%)</title><rect x="798.2" y="565" width="4.5" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="801.19" y="575.5" ></text>
+</g>
+<g >
+<title>Item_field::set_field(Field*) (1 samples, 0.39%)</title><rect x="652.4" y="677" width="4.5" height="15.0" fill="rgb(67,181,181)" rx="2" ry="2" />
+<text  x="655.39" y="687.5" ></text>
+</g>
+<g >
+<title>log_writer_write_buffer(log_t&amp;, unsigned long) (6 samples, 2.32%)</title><rect x="242.4" y="837" width="27.3" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="245.36" y="847.5" >l..</text>
+</g>
+<g >
+<title>do_sys_poll (4 samples, 1.54%)</title><rect x="397.3" y="645" width="18.2" height="15.0" fill="rgb(78,190,190)" rx="2" ry="2" />
+<text  x="400.26" y="655.5" ></text>
+</g>
+<g >
+<title>Rows_log_event::Rows_log_event(THD*, TABLE*, Table_id const&amp;, MY_BITMAP const*, bool, binary_log::Log_event_type, unsigned char const*) (1 samples, 0.39%)</title><rect x="748.1" y="629" width="4.5" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="751.07" y="639.5" ></text>
+</g>
+<g >
+<title>__get_user_nocheck_1 (1 samples, 0.39%)</title><rect x="957.6" y="501" width="4.6" height="15.0" fill="rgb(92,204,204)" rx="2" ry="2" />
+<text  x="960.64" y="511.5" ></text>
+</g>
+<g >
+<title>Item_field::fix_fields(THD*, Item**) (2 samples, 0.77%)</title><rect x="652.4" y="693" width="9.1" height="15.0" fill="rgb(69,182,182)" rx="2" ry="2" />
+<text  x="655.39" y="703.5" ></text>
+</g>
+<g >
+<title>dev_hard_start_xmit (1 samples, 0.39%)</title><rect x="474.7" y="293" width="4.6" height="15.0" fill="rgb(90,201,201)" rx="2" ry="2" />
+<text  x="477.71" y="303.5" ></text>
+</g>
+<g >
+<title>vfs_write (1 samples, 0.39%)</title><rect x="584.1" y="485" width="4.5" height="15.0" fill="rgb(90,201,201)" rx="2" ry="2" />
+<text  x="587.05" y="495.5" ></text>
+</g>
+<g >
+<title>ext4_fill_raw_inode (1 samples, 0.39%)</title><rect x="921.2" y="405" width="4.6" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="924.20" y="415.5" ></text>
+</g>
+<g >
+<title>finish_task_switch.isra.0 (1 samples, 0.39%)</title><rect x="593.2" y="421" width="4.5" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="596.17" y="431.5" ></text>
+</g>
+<g >
+<title>new_sync_write (10 samples, 3.86%)</title><rect x="916.6" y="565" width="45.6" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="919.64" y="575.5" >new_..</text>
+</g>
+<g >
+<title>Buf_fetch&lt;Buf_fetch_normal&gt;::single_page() (1 samples, 0.39%)</title><rect x="766.3" y="581" width="4.5" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="769.29" y="591.5" ></text>
+</g>
+<g >
+<title>ext4_buffered_write_iter (4 samples, 1.54%)</title><rect x="246.9" y="661" width="18.2" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="249.91" y="671.5" ></text>
+</g>
+<g >
+<title>tcp_ack (1 samples, 0.39%)</title><rect x="543.1" y="133" width="4.5" height="15.0" fill="rgb(74,187,187)" rx="2" ry="2" />
+<text  x="546.05" y="143.5" ></text>
+</g>
+<g >
+<title>syscall_exit_to_user_mode_prepare (1 samples, 0.39%)</title><rect x="980.4" y="565" width="4.6" height="15.0" fill="rgb(60,175,175)" rx="2" ry="2" />
+<text  x="983.42" y="575.5" ></text>
+</g>
+<g >
+<title>finish_task_switch.isra.0 (1 samples, 0.39%)</title><rect x="406.4" y="549" width="4.5" height="15.0" fill="rgb(102,213,213)" rx="2" ry="2" />
+<text  x="409.37" y="559.5" ></text>
+</g>
+<g >
+<title>str2my_decimal(unsigned int, char const*, unsigned long, CHARSET_INFO const*, my_decimal*) (1 samples, 0.39%)</title><rect x="1144.4" y="725" width="4.6" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="1147.44" y="735.5" ></text>
+</g>
+<g >
+<title>__GI___pthread_cond_broadcast (9 samples, 3.47%)</title><rect x="114.8" y="885" width="41.0" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="117.79" y="895.5" >__G..</text>
+</g>
+<g >
+<title>sock_def_readable (11 samples, 4.25%)</title><rect x="492.9" y="133" width="50.2" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="495.93" y="143.5" >sock_..</text>
+</g>
+<g >
+<title>bio_read_intern (6 samples, 2.32%)</title><rect x="351.7" y="597" width="27.3" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="354.70" y="607.5" >b..</text>
+</g>
+<g >
+<title>lf_hash_search(LF_HASH*, LF_PINS*, void const*, unsigned int) (1 samples, 0.39%)</title><rect x="693.4" y="661" width="4.6" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="696.40" y="671.5" ></text>
+</g>
+<g >
+<title>sock_write_iter (25 samples, 9.65%)</title><rect x="470.2" y="469" width="113.9" height="15.0" fill="rgb(60,175,175)" rx="2" ry="2" />
+<text  x="473.15" y="479.5" >sock_write_iter</text>
+</g>
+<g >
+<title>generic_write_check_limits (1 samples, 0.39%)</title><rect x="246.9" y="597" width="4.6" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="249.91" y="607.5" ></text>
+</g>
+<g >
+<title>Owned_gtids::remove_gtid(Gtid const&amp;, unsigned int) (1 samples, 0.39%)</title><rect x="966.8" y="661" width="4.5" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="969.76" y="671.5" ></text>
+</g>
+<g >
+<title>tls13_enc (1 samples, 0.39%)</title><rect x="597.7" y="629" width="4.6" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="600.72" y="639.5" ></text>
+</g>
+<g >
+<title>get_max_digest_length() (1 samples, 0.39%)</title><rect x="1180.9" y="805" width="4.5" height="15.0" fill="rgb(82,194,194)" rx="2" ry="2" />
+<text  x="1183.89" y="815.5" ></text>
+</g>
+<g >
+<title>MDL_context::try_acquire_lock_impl(MDL_request*, MDL_ticket**) (1 samples, 0.39%)</title><rect x="693.4" y="677" width="4.6" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="696.40" y="687.5" ></text>
+</g>
+<g >
+<title>__ip_queue_xmit (22 samples, 8.49%)</title><rect x="470.2" y="357" width="100.2" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="473.15" y="367.5" >__ip_queue_x..</text>
+</g>
+<g >
+<title>ktime_get (1 samples, 0.39%)</title><rect x="369.9" y="373" width="4.6" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="372.92" y="383.5" ></text>
+</g>
+<g >
+<title>ha_prepare_low(THD*, bool) (4 samples, 1.54%)</title><rect x="1089.8" y="741" width="18.2" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="1092.77" y="751.5" ></text>
+</g>
+<g >
+<title>check_insert_fields(THD*, TABLE_LIST*, mem_root_deque&lt;Item*&gt;*) (2 samples, 0.77%)</title><rect x="652.4" y="725" width="9.1" height="15.0" fill="rgb(90,202,202)" rx="2" ry="2" />
+<text  x="655.39" y="735.5" ></text>
+</g>
+<g >
+<title>ext4_dirty_inode (2 samples, 0.77%)</title><rect x="948.5" y="485" width="9.1" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="951.53" y="495.5" ></text>
+</g>
+<g >
+<title>std::__detail::_Prime_rehash_policy::_M_need_rehash(unsigned long, unsigned long, unsigned long) const (1 samples, 0.39%)</title><rect x="1062.4" y="629" width="4.6" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="1065.43" y="639.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.39%)</title><rect x="825.5" y="629" width="4.6" height="15.0" fill="rgb(105,215,215)" rx="2" ry="2" />
+<text  x="828.52" y="639.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (19 samples, 7.34%)</title><rect x="28.2" y="853" width="86.6" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="31.22" y="863.5" >entry_SYSC..</text>
+</g>
+<g >
+<title>pc_flush_slot() (8 samples, 3.09%)</title><rect x="178.6" y="837" width="36.4" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="181.57" y="847.5" >pc_..</text>
+</g>
+<g >
+<title>do_softirq (1 samples, 0.39%)</title><rect x="552.2" y="293" width="4.5" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="555.16" y="303.5" ></text>
+</g>
+<g >
+<title>virtqueue_notify (14 samples, 5.41%)</title><rect x="46.4" y="549" width="63.8" height="15.0" fill="rgb(78,190,190)" rx="2" ry="2" />
+<text  x="49.45" y="559.5" >virtque..</text>
+</g>
+<g >
+<title>Sql_cmd_dml::prepare(THD*) (13 samples, 5.02%)</title><rect x="638.7" y="757" width="59.3" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="641.73" y="767.5" >Sql_cm..</text>
+</g>
+<g >
+<title>rec_get_offsets_func(unsigned char const*, dict_index_t const*, unsigned long*, unsigned long, mem_block_info_t**) (1 samples, 0.39%)</title><rect x="789.1" y="533" width="4.5" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="792.07" y="543.5" ></text>
+</g>
+<g >
+<title>ext4_generic_write_checks (1 samples, 0.39%)</title><rect x="246.9" y="645" width="4.6" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="249.91" y="655.5" ></text>
+</g>
+<g >
+<title>wake_up_q (1 samples, 0.39%)</title><rect x="306.1" y="693" width="4.6" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="309.14" y="703.5" ></text>
+</g>
+<g >
+<title>schedule (1 samples, 0.39%)</title><rect x="406.4" y="597" width="4.5" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="409.37" y="607.5" ></text>
+</g>
+<g >
+<title>binlog_cache_data::flush(THD*, unsigned long long*, bool*) (3 samples, 1.16%)</title><rect x="1071.5" y="677" width="13.7" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="1074.54" y="687.5" ></text>
+</g>
+<g >
+<title>jbd2_journal_stop (1 samples, 0.39%)</title><rect x="916.6" y="469" width="4.6" height="15.0" fill="rgb(92,204,204)" rx="2" ry="2" />
+<text  x="919.64" y="479.5" ></text>
+</g>
+<g >
+<title>jbd2__journal_start (1 samples, 0.39%)</title><rect x="256.0" y="565" width="4.6" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="259.02" y="575.5" ></text>
+</g>
+<g >
+<title>wpacket_intern_close (1 samples, 0.39%)</title><rect x="602.3" y="629" width="4.5" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="605.28" y="639.5" ></text>
+</g>
+<g >
+<title>EVP_CipherUpdate (1 samples, 0.39%)</title><rect x="597.7" y="613" width="4.6" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="600.72" y="623.5" ></text>
+</g>
+<g >
+<title>WPACKET_finish (2 samples, 0.77%)</title><rect x="383.6" y="613" width="9.1" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="386.59" y="623.5" ></text>
+</g>
+<g >
+<title>virtio_queue_rq (15 samples, 5.79%)</title><rect x="41.9" y="565" width="68.3" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="44.89" y="575.5" >virtio_..</text>
+</g>
+<g >
+<title>ha_innobase::extra(ha_extra_function) (1 samples, 0.39%)</title><rect x="862.0" y="741" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="864.97" y="751.5" ></text>
+</g>
+<g >
+<title>btr_cur_optimistic_insert(unsigned long, btr_cur_t*, unsigned long**, mem_block_info_t**, dtuple_t*, unsigned char**, big_rec_t**, que_thr_t*, mtr_t*) (6 samples, 2.32%)</title><rect x="761.7" y="629" width="27.4" height="15.0" fill="rgb(52,166,166)" rx="2" ry="2" />
+<text  x="764.74" y="639.5" >b..</text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::process_flush_stage_queue(unsigned long long*, bool*, THD**) (5 samples, 1.93%)</title><rect x="1062.4" y="709" width="22.8" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="1065.43" y="719.5" >M..</text>
+</g>
+<g >
+<title>Clone_persist_gtid::periodic_write() (2 samples, 0.77%)</title><rect x="224.1" y="853" width="9.1" height="15.0" fill="rgb(74,187,187)" rx="2" ry="2" />
+<text  x="227.13" y="863.5" ></text>
+</g>
+<g >
+<title>ha_commit_trans(THD*, bool, bool) (2 samples, 0.77%)</title><rect x="1108.0" y="757" width="9.1" height="15.0" fill="rgb(55,169,169)" rx="2" ry="2" />
+<text  x="1110.99" y="767.5" ></text>
+</g>
+<g >
+<title>new_sync_read (4 samples, 1.54%)</title><rect x="360.8" y="485" width="18.2" height="15.0" fill="rgb(82,194,194)" rx="2" ry="2" />
+<text  x="363.81" y="495.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock_irq (1 samples, 0.39%)</title><rect x="278.8" y="597" width="4.6" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="281.80" y="607.5" ></text>
+</g>
+<g >
+<title>do_io_getevents (1 samples, 0.39%)</title><rect x="28.2" y="805" width="4.6" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="31.22" y="815.5" ></text>
+</g>
+<g >
+<title>tcp_sendmsg_locked (25 samples, 9.65%)</title><rect x="470.2" y="421" width="113.9" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="473.15" y="431.5" >tcp_sendmsg_lo..</text>
+</g>
+<g >
+<title>sk_filter_trim_cap (1 samples, 0.39%)</title><rect x="488.4" y="165" width="4.5" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="491.38" y="175.5" ></text>
+</g>
+<g >
+<title>Sql_cmd_insert_values::execute_inner(THD*) (29 samples, 11.20%)</title><rect x="698.0" y="757" width="132.1" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="700.95" y="767.5" >Sql_cmd_insert_v..</text>
+</g>
+<g >
+<title>SSL_read (16 samples, 6.18%)</title><rect x="324.4" y="725" width="72.9" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="327.36" y="735.5" >SSL_read</text>
+</g>
+<g >
+<title>sock_read_iter (4 samples, 1.54%)</title><rect x="360.8" y="469" width="18.2" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="363.81" y="479.5" ></text>
+</g>
+<g >
+<title>check_one_table_access(THD*, unsigned long, TABLE_LIST*) (1 samples, 0.39%)</title><rect x="661.5" y="741" width="4.6" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="664.51" y="751.5" ></text>
+</g>
+<g >
+<title>dict_stats_update(dict_table_t*, dict_stats_upd_option_t) (1 samples, 0.39%)</title><rect x="228.7" y="709" width="4.5" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="231.69" y="719.5" ></text>
+</g>
+<g >
+<title>tcp_rcv_space_adjust (1 samples, 0.39%)</title><rect x="369.9" y="405" width="4.6" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="372.92" y="415.5" ></text>
+</g>
+<g >
+<title>os_file_write_func(IORequest&amp;, char const*, int, void const*, unsigned long, unsigned long) (5 samples, 1.93%)</title><rect x="246.9" y="789" width="22.8" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="249.91" y="799.5" >o..</text>
+</g>
+<g >
+<title>memcg_slab_free_hook (1 samples, 0.39%)</title><rect x="543.1" y="53" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="546.05" y="63.5" ></text>
+</g>
+<g >
+<title>__dev_queue_xmit (2 samples, 0.77%)</title><rect x="474.7" y="325" width="9.1" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="477.71" y="335.5" ></text>
+</g>
+<g >
+<title>syscall_enter_from_user_mode (1 samples, 0.39%)</title><rect x="588.6" y="517" width="4.6" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="591.61" y="527.5" ></text>
+</g>
+<g >
+<title>Write_rows_log_event::~Write_rows_log_event() (1 samples, 0.39%)</title><rect x="698.0" y="709" width="4.5" height="15.0" fill="rgb(69,182,182)" rx="2" ry="2" />
+<text  x="700.95" y="719.5" ></text>
+</g>
+<g >
+<title>ksys_write (26 samples, 10.04%)</title><rect x="470.2" y="517" width="118.4" height="15.0" fill="rgb(59,174,174)" rx="2" ry="2" />
+<text  x="473.15" y="527.5" >ksys_write</text>
+</g>
+<g >
+<title>security_sock_rcv_skb (1 samples, 0.39%)</title><rect x="488.4" y="149" width="4.5" height="15.0" fill="rgb(90,201,201)" rx="2" ry="2" />
+<text  x="491.38" y="159.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (3 samples, 1.16%)</title><rect x="164.9" y="789" width="13.7" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="167.90" y="799.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock_irqrestore (8 samples, 3.09%)</title><rect x="114.8" y="741" width="36.4" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="117.79" y="751.5" >_ra..</text>
+</g>
+<g >
+<title>memset (1 samples, 0.39%)</title><rect x="948.5" y="421" width="4.6" height="15.0" fill="rgb(91,202,202)" rx="2" ry="2" />
+<text  x="951.53" y="431.5" ></text>
+</g>
+<g >
+<title>file_update_time (1 samples, 0.39%)</title><rect x="251.5" y="629" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="254.47" y="639.5" ></text>
+</g>
+<g >
+<title>io_submit_one (17 samples, 6.56%)</title><rect x="32.8" y="805" width="77.4" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="35.78" y="815.5" >io_submi..</text>
+</g>
+<g >
+<title>__blk_mq_run_hw_queue (4 samples, 1.54%)</title><rect x="183.1" y="437" width="18.3" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="186.13" y="447.5" ></text>
+</g>
+<g >
+<title>mlog_write_ulint(unsigned char*, unsigned long, mlog_id_t, mtr_t*) (1 samples, 0.39%)</title><rect x="1035.1" y="517" width="4.6" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="1038.10" y="527.5" ></text>
+</g>
+<g >
+<title>__iomap_dio_rw (5 samples, 1.93%)</title><rect x="183.1" y="533" width="22.8" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="186.13" y="543.5" >_..</text>
+</g>
+<g >
+<title>blk_finish_plug (5 samples, 1.93%)</title><rect x="183.1" y="517" width="22.8" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="186.13" y="527.5" >b..</text>
+</g>
+<g >
+<title>__schedule (3 samples, 1.16%)</title><rect x="164.9" y="757" width="13.7" height="15.0" fill="rgb(93,204,204)" rx="2" ry="2" />
+<text  x="167.90" y="767.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (10 samples, 3.86%)</title><rect x="916.6" y="629" width="45.6" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="919.64" y="639.5" >entr..</text>
+</g>
+<g >
+<title>buf_page_get_gen(page_id_t const&amp;, page_size_t const&amp;, unsigned long, buf_block_t*, Page_fetch, ut::Location, mtr_t*, bool) (1 samples, 0.39%)</title><rect x="766.3" y="597" width="4.5" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="769.29" y="607.5" ></text>
+</g>
+<g >
+<title>buf_page_hash_get_low(buf_pool_t*, page_id_t const&amp;) (1 samples, 0.39%)</title><rect x="770.8" y="533" width="4.6" height="15.0" fill="rgb(68,181,181)" rx="2" ry="2" />
+<text  x="773.85" y="543.5" ></text>
+</g>
+<g >
+<title>__GI___pthread_mutex_unlock_usercnt (1 samples, 0.39%)</title><rect x="237.8" y="837" width="4.6" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="240.80" y="847.5" ></text>
+</g>
+<g >
+<title>virtio_queue_rq (1 samples, 0.39%)</title><rect x="41.9" y="549" width="4.5" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="44.89" y="559.5" ></text>
+</g>
+<g >
+<title>row_insert_for_mysql_using_ins_graph(unsigned char const*, row_prebuilt_t*) (1 samples, 0.39%)</title><rect x="228.7" y="725" width="4.5" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="231.69" y="735.5" ></text>
+</g>
+<g >
+<title>os_event::wait_time_low(std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000l&gt; &gt;, long) (1 samples, 0.39%)</title><rect x="233.2" y="837" width="4.6" height="15.0" fill="rgb(63,176,176)" rx="2" ry="2" />
+<text  x="236.24" y="847.5" ></text>
+</g>
+<g >
+<title>Fil_system::flush_file_spaces(unsigned char) (4 samples, 1.54%)</title><rect x="274.2" y="789" width="18.3" height="15.0" fill="rgb(106,217,217)" rx="2" ry="2" />
+<text  x="277.25" y="799.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock (1 samples, 0.39%)</title><rect x="201.4" y="453" width="4.5" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="204.35" y="463.5" ></text>
+</g>
+<g >
+<title>tcp_rcv_established (1 samples, 0.39%)</title><rect x="547.6" y="133" width="4.6" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="550.61" y="143.5" ></text>
+</g>
+<g >
+<title>generic_perform_write (1 samples, 0.39%)</title><rect x="260.6" y="645" width="4.5" height="15.0" fill="rgb(100,210,210)" rx="2" ry="2" />
+<text  x="263.58" y="655.5" ></text>
+</g>
+<g >
+<title>blk_mq_sched_insert_requests (5 samples, 1.93%)</title><rect x="183.1" y="469" width="22.8" height="15.0" fill="rgb(82,194,194)" rx="2" ry="2" />
+<text  x="186.13" y="479.5" >b..</text>
+</g>
+<g >
+<title>syscall_exit_to_user_mode (1 samples, 0.39%)</title><rect x="980.4" y="597" width="4.6" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="983.42" y="607.5" ></text>
+</g>
+<g >
+<title>exit_to_user_mode_prepare (1 samples, 0.39%)</title><rect x="593.2" y="501" width="4.5" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="596.17" y="511.5" ></text>
+</g>
+<g >
+<title>mem_root_deque&lt;Item*&gt;::push_back(Item* const&amp;) (1 samples, 0.39%)</title><rect x="1171.8" y="741" width="4.5" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="1174.78" y="751.5" ></text>
+</g>
+<g >
+<title>THD::send_statement_status() (41 samples, 15.83%)</title><rect x="429.2" y="805" width="186.7" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="432.15" y="815.5" >THD::send_statement_stat..</text>
+</g>
+<g >
+<title>do_futex (4 samples, 1.54%)</title><rect x="160.3" y="821" width="18.3" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="163.35" y="831.5" ></text>
+</g>
+<g >
+<title>__futex_abstimed_wait_common (5 samples, 1.93%)</title><rect x="155.8" y="885" width="22.8" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="158.79" y="895.5" >_..</text>
+</g>
+<g >
+<title>os_event_reset(os_event*) (1 samples, 0.39%)</title><rect x="269.7" y="853" width="4.5" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="272.69" y="863.5" ></text>
+</g>
+<g >
+<title>tls13_enc (1 samples, 0.39%)</title><rect x="392.7" y="645" width="4.6" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="395.70" y="655.5" ></text>
+</g>
+<g >
+<title>should_failslab (1 samples, 0.39%)</title><rect x="570.4" y="341" width="4.5" height="15.0" fill="rgb(76,188,188)" rx="2" ry="2" />
+<text  x="573.39" y="351.5" ></text>
+</g>
+<g >
+<title>__inet_lookup_established (1 samples, 0.39%)</title><rect x="483.8" y="149" width="4.6" height="15.0" fill="rgb(101,211,211)" rx="2" ry="2" />
+<text  x="486.82" y="159.5" ></text>
+</g>
+<g >
+<title>futex_wake (8 samples, 3.09%)</title><rect x="114.8" y="805" width="36.4" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="117.79" y="815.5" >fut..</text>
+</g>
+<g >
+<title>__ext4_journal_stop (1 samples, 0.39%)</title><rect x="916.6" y="485" width="4.6" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="919.64" y="495.5" ></text>
+</g>
+<g >
+<title>check_single_table_access(THD*, unsigned long, TABLE_LIST*, bool) (1 samples, 0.39%)</title><rect x="666.1" y="741" width="4.5" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="669.06" y="751.5" ></text>
+</g>
+<g >
+<title>new_sync_write (25 samples, 9.65%)</title><rect x="470.2" y="485" width="113.9" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="473.15" y="495.5" >new_sync_write</text>
+</g>
+<g >
+<title>try_to_wake_up (1 samples, 0.39%)</title><rect x="306.1" y="677" width="4.6" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="309.14" y="687.5" ></text>
+</g>
+<g >
+<title>lshift(Bigint*, int, Stack_alloc*) (1 samples, 0.39%)</title><rect x="716.2" y="645" width="4.5" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="719.18" y="655.5" ></text>
+</g>
+<g >
+<title>__x64_sys_pwrite64 (4 samples, 1.54%)</title><rect x="246.9" y="709" width="18.2" height="15.0" fill="rgb(102,213,213)" rx="2" ry="2" />
+<text  x="249.91" y="719.5" ></text>
+</g>
+<g >
+<title>write_record(THD*, TABLE*, COPY_INFO*, COPY_INFO*) (1 samples, 0.39%)</title><rect x="852.9" y="757" width="4.5" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="855.86" y="767.5" ></text>
+</g>
+<g >
+<title>ha_innobase::write_row(unsigned char*) (16 samples, 6.18%)</title><rect x="757.2" y="709" width="72.9" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="760.18" y="719.5" >ha_innob..</text>
+</g>
+<g >
+<title>mysql_encryption_file_write(IO_CACHE*, unsigned char const*, unsigned long, int) (10 samples, 3.86%)</title><rect x="916.6" y="661" width="45.6" height="15.0" fill="rgb(54,168,168)" rx="2" ry="2" />
+<text  x="919.64" y="671.5" >mysq..</text>
+</g>
+<g >
+<title>Protocol_classic::get_command(COM_DATA*, enum_server_command*) (20 samples, 7.72%)</title><rect x="324.4" y="821" width="91.1" height="15.0" fill="rgb(95,207,207)" rx="2" ry="2" />
+<text  x="327.36" y="831.5" >Protocol_c..</text>
+</g>
+<g >
+<title>ha_innobase::release_auto_increment() (1 samples, 0.39%)</title><rect x="720.7" y="741" width="4.6" height="15.0" fill="rgb(90,202,202)" rx="2" ry="2" />
+<text  x="723.73" y="751.5" ></text>
+</g>
+<g >
+<title>fil_aio_wait(unsigned long) (9 samples, 3.47%)</title><rect x="274.2" y="837" width="41.1" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="277.25" y="847.5" >fil..</text>
+</g>
+<g >
+<title>ha_commit_low(THD*, bool, bool) (1 samples, 0.39%)</title><rect x="1112.5" y="725" width="4.6" height="15.0" fill="rgb(77,189,189)" rx="2" ry="2" />
+<text  x="1115.55" y="735.5" ></text>
+</g>
+<g >
+<title>kmem_cache_alloc_node (1 samples, 0.39%)</title><rect x="570.4" y="373" width="4.5" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="573.39" y="383.5" ></text>
+</g>
+<g >
+<title>__blk_mq_delay_run_hw_queue (16 samples, 6.18%)</title><rect x="37.3" y="661" width="72.9" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="40.34" y="671.5" >__blk_mq..</text>
+</g>
+<g >
+<title>LEX::clear_privileges() (1 samples, 0.39%)</title><rect x="620.5" y="773" width="4.6" height="15.0" fill="rgb(56,170,170)" rx="2" ry="2" />
+<text  x="623.50" y="783.5" ></text>
+</g>
+<g >
+<title>Item_basic_constant::used_tables() const (1 samples, 0.39%)</title><rect x="638.7" y="741" width="4.6" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="641.73" y="751.5" ></text>
+</g>
+<g >
+<title>lex_one_token(Lexer_yystype*, THD*) (4 samples, 1.54%)</title><rect x="1149.0" y="725" width="18.2" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="1152.00" y="735.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (5 samples, 1.93%)</title><rect x="183.1" y="645" width="22.8" height="15.0" fill="rgb(82,195,195)" rx="2" ry="2" />
+<text  x="186.13" y="655.5" >e..</text>
+</g>
+<g >
+<title>jbd2__journal_start (1 samples, 0.39%)</title><rect x="948.5" y="453" width="4.6" height="15.0" fill="rgb(105,216,216)" rx="2" ry="2" />
+<text  x="951.53" y="463.5" ></text>
+</g>
+<g >
+<title>rec_init_offsets_comp_ordinary(unsigned char const*, bool, dict_index_t const*, unsigned long*) (1 samples, 0.39%)</title><rect x="789.1" y="517" width="4.5" height="15.0" fill="rgb(93,205,205)" rx="2" ry="2" />
+<text  x="792.07" y="527.5" ></text>
+</g>
+<g >
+<title>trx_undo_assign_undo(trx_t*, trx_undo_ptr_t*, unsigned long) (3 samples, 1.16%)</title><rect x="770.8" y="597" width="13.7" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="773.85" y="607.5" ></text>
+</g>
+<g >
+<title>try_to_wake_up (8 samples, 3.09%)</title><rect x="114.8" y="773" width="36.4" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="117.79" y="783.5" >try..</text>
+</g>
+<g >
+<title>__ext4_mark_inode_dirty (2 samples, 0.77%)</title><rect x="921.2" y="469" width="9.1" height="15.0" fill="rgb(90,202,202)" rx="2" ry="2" />
+<text  x="924.20" y="479.5" ></text>
+</g>
+<g >
+<title>aes_gcm_cipher (1 samples, 0.39%)</title><rect x="379.0" y="581" width="4.6" height="15.0" fill="rgb(79,191,191)" rx="2" ry="2" />
+<text  x="382.03" y="591.5" ></text>
+</g>
+<g >
+<title>Clone_persist_gtid::trx_check_set(trx_t*, bool, bool, bool&amp;) (1 samples, 0.39%)</title><rect x="1039.7" y="613" width="4.5" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="1042.65" y="623.5" ></text>
+</g>
+<g >
+<title>buf_page_get_gen(page_id_t const&amp;, page_size_t const&amp;, unsigned long, buf_block_t*, Page_fetch, ut::Location, mtr_t*, bool) (1 samples, 0.39%)</title><rect x="1016.9" y="549" width="4.5" height="15.0" fill="rgb(79,192,192)" rx="2" ry="2" />
+<text  x="1019.87" y="559.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2 samples, 0.77%)</title><rect x="975.9" y="629" width="9.1" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="978.87" y="639.5" ></text>
+</g>
+<g >
+<title>selinux_ip_postroute (1 samples, 0.39%)</title><rect x="556.7" y="293" width="4.6" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="559.72" y="303.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.39%)</title><rect x="306.1" y="757" width="4.6" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="309.14" y="767.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.77%)</title><rect x="14.6" y="853" width="9.1" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="17.56" y="863.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock_irqrestore (8 samples, 3.09%)</title><rect x="114.8" y="757" width="36.4" height="15.0" fill="rgb(55,170,170)" rx="2" ry="2" />
+<text  x="117.79" y="767.5" >_ra..</text>
+</g>
+<g >
+<title>__x64_sys_io_submit (17 samples, 6.56%)</title><rect x="32.8" y="821" width="77.4" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="35.78" y="831.5" >__x64_sy..</text>
+</g>
+<g >
+<title>schedule_hrtimeout_range_clock (1 samples, 0.39%)</title><rect x="406.4" y="613" width="4.5" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="409.37" y="623.5" ></text>
+</g>
+<g >
+<title>mtr_t::commit() (1 samples, 0.39%)</title><rect x="985.0" y="597" width="4.5" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="987.98" y="607.5" ></text>
+</g>
+<g >
+<title>tcp_write_xmit (22 samples, 8.49%)</title><rect x="470.2" y="389" width="100.2" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="473.15" y="399.5" >tcp_write_xmit</text>
+</g>
+<g >
+<title>dict_stats_update_transient_for_index(dict_index_t*) (1 samples, 0.39%)</title><rect x="228.7" y="693" width="4.5" height="15.0" fill="rgb(93,204,204)" rx="2" ry="2" />
+<text  x="231.69" y="703.5" ></text>
+</g>
+<g >
+<title>page_copy_rec_list_end(buf_block_t*, buf_block_t*, unsigned char*, dict_index_t*, mtr_t*) (1 samples, 0.39%)</title><rect x="789.1" y="581" width="4.5" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="792.07" y="591.5" ></text>
+</g>
+<g >
+<title>ext4_dirty_inode (2 samples, 0.77%)</title><rect x="921.2" y="485" width="9.1" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="924.20" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;binary_log::Uuid, std::pair&lt;binary_log::Uuid const, std::unique_ptr&lt;Sid_map::Node, My_free_deleter&gt; &gt;, Malloc_allocator&lt;std::pair&lt;binary_log::Uuid const, std::unique_ptr&lt;Sid_map::Node, My_free_deleter&gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;binary_log::Uuid&gt;, binary_log::Hash_Uuid, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;true, false, true&gt; &gt;::_M_find_before_node(unsigned long, binary_log::Uuid const&amp;, unsigned long) const (1 samples, 0.39%)</title><rect x="224.1" y="773" width="4.6" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="227.13" y="783.5" ></text>
+</g>
+<g >
+<title>xas_load (1 samples, 0.39%)</title><rect x="944.0" y="453" width="4.5" height="15.0" fill="rgb(98,209,209)" rx="2" ry="2" />
+<text  x="946.98" y="463.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock_irqrestore (1 samples, 0.39%)</title><rect x="306.1" y="645" width="4.6" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="309.14" y="655.5" ></text>
+</g>
+<g >
+<title>__blk_mq_delay_run_hw_queue (4 samples, 1.54%)</title><rect x="183.1" y="453" width="18.3" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="186.13" y="463.5" ></text>
+</g>
+<g >
+<title>buf_flush_do_batch(buf_pool_t*, buf_flush_t, unsigned long, unsigned long, unsigned long*) (8 samples, 3.09%)</title><rect x="178.6" y="821" width="36.4" height="15.0" fill="rgb(68,182,182)" rx="2" ry="2" />
+<text  x="181.57" y="831.5" >buf..</text>
+</g>
+<g >
+<title>vio_ssl_read(Vio*, unsigned char*, unsigned long) (20 samples, 7.72%)</title><rect x="324.4" y="741" width="91.1" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="327.36" y="751.5" >vio_ssl_re..</text>
+</g>
+<g >
+<title>syscall (1 samples, 0.39%)</title><rect x="210.5" y="661" width="4.5" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="213.46" y="671.5" ></text>
+</g>
+<g >
+<title>__mark_inode_dirty (3 samples, 1.16%)</title><rect x="916.6" y="501" width="13.7" height="15.0" fill="rgb(67,180,180)" rx="2" ry="2" />
+<text  x="919.64" y="511.5" ></text>
+</g>
+<g >
+<title>cmp_dtuple_rec_with_match_low(dtuple_t const*, unsigned char const*, dict_index_t const*, unsigned long const*, unsigned long, unsigned long*) (1 samples, 0.39%)</title><rect x="802.7" y="597" width="4.6" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="805.74" y="607.5" ></text>
+</g>
+<g >
+<title>open_table(THD*, TABLE_LIST*, Open_table_context*) (2 samples, 0.77%)</title><rect x="688.8" y="709" width="9.2" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="691.84" y="719.5" ></text>
+</g>
+<g >
+<title>trx_purge_add_update_undo_to_history(trx_t*, trx_undo_ptr_t*, unsigned char*, bool, unsigned long, mtr_t*) (6 samples, 2.32%)</title><rect x="1012.3" y="565" width="27.4" height="15.0" fill="rgb(78,190,190)" rx="2" ry="2" />
+<text  x="1015.32" y="575.5" >t..</text>
+</g>
+<g >
+<title>BIO_read (6 samples, 2.32%)</title><rect x="351.7" y="613" width="27.3" height="15.0" fill="rgb(91,202,202)" rx="2" ry="2" />
+<text  x="354.70" y="623.5" >B..</text>
+</g>
+<g >
+<title>copy_page_from_iter_atomic (1 samples, 0.39%)</title><rect x="260.6" y="613" width="4.5" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="263.58" y="623.5" ></text>
+</g>
+<g >
+<title>tcp_recvmsg (3 samples, 1.16%)</title><rect x="360.8" y="437" width="13.7" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="363.81" y="447.5" ></text>
+</g>
+<g >
+<title>handle_connection (192 samples, 74.13%)</title><rect x="315.3" y="853" width="874.7" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="318.25" y="863.5" >handle_connection</text>
+</g>
+<g >
+<title>buf_page_get_gen(page_id_t const&amp;, page_size_t const&amp;, unsigned long, buf_block_t*, Page_fetch, ut::Location, mtr_t*, bool) (3 samples, 1.16%)</title><rect x="770.8" y="581" width="13.7" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="773.85" y="591.5" ></text>
+</g>
+<g >
+<title>Trans_delegate::before_dml(THD*, int&amp;) (1 samples, 0.39%)</title><rect x="830.1" y="757" width="4.5" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="833.08" y="767.5" ></text>
+</g>
+<g >
+<title>Rows_log_event* THD::binlog_prepare_pending_rows_event&lt;Write_rows_log_event&gt;(TABLE*, unsigned int, unsigned long, bool, unsigned char const*, unsigned int) (1 samples, 0.39%)</title><rect x="748.1" y="661" width="4.5" height="15.0" fill="rgb(56,171,171)" rx="2" ry="2" />
+<text  x="751.07" y="671.5" ></text>
+</g>
+<g >
+<title>__raw_callee_save___pv_queued_spin_unlock (1 samples, 0.39%)</title><rect x="201.4" y="437" width="4.5" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="204.35" y="447.5" ></text>
+</g>
+<g >
+<title>os_aio_handler(unsigned long, fil_node_t**, void**, IORequest*) (4 samples, 1.54%)</title><rect x="297.0" y="821" width="18.3" height="15.0" fill="rgb(66,179,179)" rx="2" ry="2" />
+<text  x="300.03" y="831.5" ></text>
+</g>
+<g >
+<title>Buf_fetch&lt;Buf_fetch_normal&gt;::single_page() (1 samples, 0.39%)</title><rect x="798.2" y="597" width="4.5" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="801.19" y="607.5" ></text>
+</g>
+<g >
+<title>selinux_xfrm_postroute_last (1 samples, 0.39%)</title><rect x="561.3" y="261" width="4.5" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="564.27" y="271.5" ></text>
+</g>
+<g >
+<title>buf_page_io_complete(buf_page_t*, bool) (4 samples, 1.54%)</title><rect x="274.2" y="821" width="18.3" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="277.25" y="831.5" ></text>
+</g>
+<g >
+<title>tcp_clean_rtx_queue.constprop.0 (1 samples, 0.39%)</title><rect x="543.1" y="117" width="4.5" height="15.0" fill="rgb(98,209,209)" rx="2" ry="2" />
+<text  x="546.05" y="127.5" ></text>
+</g>
+<g >
+<title>EVP_CipherInit_ex (1 samples, 0.39%)</title><rect x="347.1" y="629" width="4.6" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="350.14" y="639.5" ></text>
+</g>
+<g >
+<title>__GI_____strtoull_l_internal (1 samples, 0.39%)</title><rect x="1080.7" y="661" width="4.5" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="1083.66" y="671.5" ></text>
+</g>
+<g >
+<title>Clone_persist_gtid::add(Gtid_desc const&amp;) (1 samples, 0.39%)</title><rect x="989.5" y="581" width="4.6" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="992.54" y="591.5" ></text>
+</g>
+<g >
+<title>blk_mq_flush_plug_list (16 samples, 6.18%)</title><rect x="37.3" y="693" width="72.9" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="40.34" y="703.5" >blk_mq_f..</text>
+</g>
+<g >
+<title>__strlen_avx2 (1 samples, 0.39%)</title><rect x="23.7" y="869" width="4.5" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="26.67" y="879.5" ></text>
+</g>
+<g >
+<title>launch_hook_trans_begin(THD*, TABLE_LIST*) (6 samples, 2.32%)</title><rect x="866.5" y="773" width="27.4" height="15.0" fill="rgb(94,206,206)" rx="2" ry="2" />
+<text  x="869.53" y="783.5" >l..</text>
+</g>
+<g >
+<title>__fget_light (1 samples, 0.39%)</title><rect x="397.3" y="597" width="4.5" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="400.26" y="607.5" ></text>
+</g>
+<g >
+<title>blk_mq_flush_plug_list (5 samples, 1.93%)</title><rect x="183.1" y="485" width="22.8" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="186.13" y="495.5" >b..</text>
+</g>
+<g >
+<title>should_failslab (1 samples, 0.39%)</title><rect x="570.4" y="357" width="4.5" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="573.39" y="367.5" ></text>
+</g>
+<g >
+<title>ssl_read_internal (16 samples, 6.18%)</title><rect x="324.4" y="709" width="72.9" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="327.36" y="719.5" >ssl_read..</text>
+</g>
+<g >
+<title>void dd::cache::Dictionary_client::remove_uncommitted_objects&lt;dd::Tablespace&gt;(bool) (2 samples, 0.77%)</title><rect x="903.0" y="741" width="9.1" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="905.97" y="751.5" ></text>
+</g>
+<g >
+<title>vio_is_blocking(Vio*) (1 samples, 0.39%)</title><rect x="611.4" y="757" width="4.5" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="614.39" y="767.5" ></text>
+</g>
+<g >
+<title>copy_page_from_iter_atomic (1 samples, 0.39%)</title><rect x="260.6" y="629" width="4.5" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="263.58" y="639.5" ></text>
+</g>
+<g >
+<title>lookup_ioctx (1 samples, 0.39%)</title><rect x="28.2" y="789" width="4.6" height="15.0" fill="rgb(84,197,197)" rx="2" ry="2" />
+<text  x="31.22" y="799.5" ></text>
+</g>
+<g >
+<title>virtqueue_notify (1 samples, 0.39%)</title><rect x="46.4" y="533" width="4.6" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="49.45" y="543.5" ></text>
+</g>
+<g >
+<title>my_strcasecmp_utf8 (1 samples, 0.39%)</title><rect x="656.9" y="645" width="4.6" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="659.95" y="655.5" ></text>
+</g>
+<g >
+<title>ext4_dio_write_iter (5 samples, 1.93%)</title><rect x="183.1" y="565" width="22.8" height="15.0" fill="rgb(79,191,191)" rx="2" ry="2" />
+<text  x="186.13" y="575.5" >e..</text>
+</g>
+<g >
+<title>Sql_cmd_insert_base::prepare_inner(THD*) (4 samples, 1.54%)</title><rect x="643.3" y="741" width="18.2" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="646.28" y="751.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (19 samples, 7.34%)</title><rect x="28.2" y="837" width="86.6" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="31.22" y="847.5" >do_syscall..</text>
+</g>
+<g >
+<title>__rcu_read_unlock (1 samples, 0.39%)</title><rect x="953.1" y="373" width="4.5" height="15.0" fill="rgb(65,179,179)" rx="2" ry="2" />
+<text  x="956.09" y="383.5" ></text>
+</g>
+<g >
+<title>PolicyMutex&lt;TTASEventMutex&lt;GenericPolicy&gt; &gt;::enter(unsigned int, unsigned int, char const*, unsigned int) (1 samples, 0.39%)</title><rect x="1057.9" y="549" width="4.5" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="1060.88" y="559.5" ></text>
+</g>
+<g >
+<title>tcp_recvmsg_locked (2 samples, 0.77%)</title><rect x="365.4" y="421" width="9.1" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="368.37" y="431.5" ></text>
+</g>
+<g >
+<title>Log_event::write(Basic_ostream*) (1 samples, 0.39%)</title><rect x="702.5" y="693" width="4.6" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="705.51" y="703.5" ></text>
+</g>
+<g >
+<title>blkdev_issue_flush (1 samples, 0.39%)</title><rect x="278.8" y="661" width="4.6" height="15.0" fill="rgb(101,211,211)" rx="2" ry="2" />
+<text  x="281.80" y="671.5" ></text>
+</g>
+<g >
+<title>__ip_finish_output (1 samples, 0.39%)</title><rect x="470.2" y="325" width="4.5" height="15.0" fill="rgb(74,187,187)" rx="2" ry="2" />
+<text  x="473.15" y="335.5" ></text>
+</g>
+<g >
+<title>stop_this_handle (1 samples, 0.39%)</title><rect x="916.6" y="437" width="4.6" height="15.0" fill="rgb(103,213,213)" rx="2" ry="2" />
+<text  x="919.64" y="447.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (4 samples, 1.54%)</title><rect x="160.3" y="837" width="18.3" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="163.35" y="847.5" ></text>
+</g>
+<g >
+<title>__inet_lookup_established (1 samples, 0.39%)</title><rect x="483.8" y="165" width="4.6" height="15.0" fill="rgb(105,216,216)" rx="2" ry="2" />
+<text  x="486.82" y="175.5" ></text>
+</g>
+<g >
+<title>close_thread_tables(THD*) (2 samples, 0.77%)</title><rect x="857.4" y="773" width="9.1" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="860.41" y="783.5" ></text>
+</g>
+<g >
+<title>__fget_light (1 samples, 0.39%)</title><rect x="397.3" y="613" width="4.5" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="400.26" y="623.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__si_class_type_info::~__si_class_type_info() (2 samples, 0.77%)</title><rect x="14.6" y="869" width="9.1" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="17.56" y="879.5" ></text>
+</g>
+<g >
+<title>bread_conv (6 samples, 2.32%)</title><rect x="351.7" y="581" width="27.3" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="354.70" y="591.5" >b..</text>
+</g>
+<g >
+<title>vfs_write (5 samples, 1.93%)</title><rect x="183.1" y="597" width="22.8" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="186.13" y="607.5" >v..</text>
+</g>
+<g >
+<title>ksys_write (10 samples, 3.86%)</title><rect x="916.6" y="597" width="45.6" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="919.64" y="607.5" >ksys..</text>
+</g>
+<g >
+<title>THD::sql_parser() (13 samples, 5.02%)</title><rect x="1117.1" y="773" width="59.2" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="1120.10" y="783.5" >THD::s..</text>
+</g>
+<g >
+<title>Clone_persist_gtid::flush_gtids(THD*) (2 samples, 0.77%)</title><rect x="224.1" y="837" width="9.1" height="15.0" fill="rgb(80,192,192)" rx="2" ry="2" />
+<text  x="227.13" y="847.5" ></text>
+</g>
+<g >
+<title>PROFILING::status_change(char const*, char const*, char const*, unsigned int) (1 samples, 0.39%)</title><rect x="424.6" y="805" width="4.6" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="427.59" y="815.5" ></text>
+</g>
+<g >
+<title>cmp_rec_rec_with_match(unsigned char const*, unsigned char const*, unsigned long const*, unsigned long const*, dict_index_t const*, bool, bool, unsigned long*, bool) (1 samples, 0.39%)</title><rect x="228.7" y="661" width="4.5" height="15.0" fill="rgb(65,179,179)" rx="2" ry="2" />
+<text  x="231.69" y="671.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.39%)</title><rect x="351.7" y="517" width="4.6" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="354.70" y="527.5" ></text>
+</g>
+<g >
+<title>pfs_spawn_thread (192 samples, 74.13%)</title><rect x="315.3" y="869" width="874.7" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="318.25" y="879.5" >pfs_spawn_thread</text>
+</g>
+<g >
+<title>Gtid_state::generate_automatic_gtid(THD*, int, long, int*) (1 samples, 0.39%)</title><rect x="1062.4" y="677" width="4.6" height="15.0" fill="rgb(95,207,207)" rx="2" ry="2" />
+<text  x="1065.43" y="687.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::process_after_commit_stage_queue(THD*, THD*) (1 samples, 0.39%)</title><rect x="962.2" y="709" width="4.6" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="965.20" y="719.5" ></text>
+</g>
+<g >
+<title>buf_flush_page_and_try_neighbors(buf_page_t*, buf_flush_t, unsigned long, unsigned long*) (8 samples, 3.09%)</title><rect x="178.6" y="805" width="36.4" height="15.0" fill="rgb(82,195,195)" rx="2" ry="2" />
+<text  x="181.57" y="815.5" >buf..</text>
+</g>
+<g >
+<title>ext4_es_insert_delayed_block (1 samples, 0.39%)</title><rect x="934.9" y="437" width="4.5" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="937.86" y="447.5" ></text>
+</g>
+<g >
+<title>Double_write::prepare(buf_page_t const*, void**, unsigned int*) (1 samples, 0.39%)</title><rect x="178.6" y="741" width="4.5" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="181.57" y="751.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::write_transaction(THD*, binlog_cache_data*, Binlog_event_writer*) (2 samples, 0.77%)</title><rect x="1071.5" y="661" width="9.2" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="1074.54" y="671.5" ></text>
+</g>
+<g >
+<title>do_command(THD*) (191 samples, 73.75%)</title><rect x="315.3" y="837" width="870.1" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="318.25" y="847.5" >do_command(THD*)</text>
+</g>
+<g >
+<title>process_table_fks(THD*, Query_tables_list*, TABLE_SHARE*, bool, bool, bool, TABLE_LIST*, bool*) (1 samples, 0.39%)</title><rect x="679.7" y="693" width="4.6" height="15.0" fill="rgb(108,219,219)" rx="2" ry="2" />
+<text  x="682.73" y="703.5" ></text>
+</g>
+<g >
+<title>ssl3_read (16 samples, 6.18%)</title><rect x="324.4" y="693" width="72.9" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="327.36" y="703.5" >ssl3_read</text>
+</g>
+<g >
+<title>crc32c_pcl_intel_update (1 samples, 0.39%)</title><rect x="925.8" y="373" width="4.5" height="15.0" fill="rgb(70,184,184)" rx="2" ry="2" />
+<text  x="928.75" y="383.5" ></text>
+</g>
+<g >
+<title>net_read_raw_loop(NET*, unsigned long) (20 samples, 7.72%)</title><rect x="324.4" y="757" width="91.1" height="15.0" fill="rgb(55,169,169)" rx="2" ry="2" />
+<text  x="327.36" y="767.5" >net_read_r..</text>
+</g>
+<g >
+<title>pfs_rw_lock_x_lock_func(rw_lock_t*, unsigned long, ut::Location) [clone .constprop.344] (1 samples, 0.39%)</title><rect x="215.0" y="837" width="4.6" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="218.02" y="847.5" ></text>
+</g>
+<g >
+<title>Gtid_state::acquire_ownership(THD*, Gtid const&amp;) (1 samples, 0.39%)</title><rect x="1062.4" y="661" width="4.6" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="1065.43" y="671.5" ></text>
+</g>
+<g >
+<title>rec_get_offsets_func(unsigned char const*, dict_index_t const*, unsigned long*, unsigned long, mem_block_info_t**) (2 samples, 0.77%)</title><rect x="807.3" y="597" width="9.1" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="810.30" y="607.5" ></text>
+</g>
+<g >
+<title>_raw_read_lock (1 samples, 0.39%)</title><rect x="32.8" y="709" width="4.5" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="35.78" y="719.5" ></text>
+</g>
+<g >
+<title>Table_map_log_event::init_charset_field(std::function&lt;bool (Field const*)&gt;, binary_log::Table_map_event::Optional_metadata_field_type, binary_log::Table_map_event::Optional_metadata_field_type) (1 samples, 0.39%)</title><rect x="743.5" y="645" width="4.6" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="746.51" y="655.5" ></text>
+</g>
+<g >
+<title>__raw_callee_save___pv_queued_spin_unlock (1 samples, 0.39%)</title><rect x="201.4" y="421" width="4.5" height="15.0" fill="rgb(76,188,188)" rx="2" ry="2" />
+<text  x="204.35" y="431.5" ></text>
+</g>
+<g >
+<title>dd::cache::Dictionary_client::commit_modified_objects() (4 samples, 1.54%)</title><rect x="893.9" y="757" width="18.2" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="896.86" y="767.5" ></text>
+</g>
+<g >
+<title>Item_field::~Item_field() (1 samples, 0.39%)</title><rect x="615.9" y="773" width="4.6" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="618.95" y="783.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::flush_thread_caches(THD*) (4 samples, 1.54%)</title><rect x="1067.0" y="693" width="18.2" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="1069.99" y="703.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 0.39%)</title><rect x="306.1" y="773" width="4.6" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="309.14" y="783.5" ></text>
+</g>
+<g >
+<title>syscall_exit_to_user_mode (1 samples, 0.39%)</title><rect x="110.2" y="821" width="4.6" height="15.0" fill="rgb(99,209,209)" rx="2" ry="2" />
+<text  x="113.23" y="831.5" ></text>
+</g>
+<g >
+<title>gcm_ghash_avx (1 samples, 0.39%)</title><rect x="379.0" y="565" width="4.6" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="382.03" y="575.5" ></text>
+</g>
+<g >
+<title>innobase_commit_low(trx_t*) (19 samples, 7.34%)</title><rect x="975.9" y="661" width="86.5" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="978.87" y="671.5" >innobase_c..</text>
+</g>
+<g >
+<title>__kfree_skb (1 samples, 0.39%)</title><rect x="543.1" y="101" width="4.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="546.05" y="111.5" ></text>
+</g>
+<g >
+<title>ha_innobase::write_row(unsigned char*) (1 samples, 0.39%)</title><rect x="228.7" y="741" width="4.5" height="15.0" fill="rgb(68,181,181)" rx="2" ry="2" />
+<text  x="231.69" y="751.5" ></text>
+</g>
+<g >
+<title>log_writer(log_t*) (7 samples, 2.70%)</title><rect x="237.8" y="853" width="31.9" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="240.80" y="863.5" >lo..</text>
+</g>
+<g >
+<title>vio_socket_timeout(Vio*, unsigned int, bool) (1 samples, 0.39%)</title><rect x="1185.4" y="837" width="4.6" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="1188.44" y="847.5" ></text>
+</g>
+<g >
+<title>process_backlog (15 samples, 5.79%)</title><rect x="483.8" y="245" width="68.4" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="486.82" y="255.5" >process..</text>
+</g>
+<g >
+<title>do_syscall_64 (2 samples, 0.77%)</title><rect x="975.9" y="613" width="9.1" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="978.87" y="623.5" ></text>
+</g>
+<g >
+<title>nf_hook_slow (3 samples, 1.16%)</title><rect x="556.7" y="325" width="13.7" height="15.0" fill="rgb(95,207,207)" rx="2" ry="2" />
+<text  x="559.72" y="335.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::flush_and_set_pending_rows_event(THD*, Rows_log_event*, bool) (2 samples, 0.77%)</title><rect x="698.0" y="725" width="9.1" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="700.95" y="735.5" ></text>
+</g>
+<g >
+<title>fput_many (1 samples, 0.39%)</title><rect x="356.3" y="501" width="4.5" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="359.25" y="511.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::commit(THD*, bool) (1 samples, 0.39%)</title><rect x="1112.5" y="741" width="4.6" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="1115.55" y="751.5" ></text>
+</g>
+<g >
+<title>trx_undo_report_row_operation(unsigned long, unsigned long, que_thr_t*, dict_index_t*, dtuple_t const*, upd_t const*, unsigned long, unsigned char const*, unsigned long const*, unsigned long*) (5 samples, 1.93%)</title><rect x="766.3" y="613" width="22.8" height="15.0" fill="rgb(74,187,187)" rx="2" ry="2" />
+<text  x="769.29" y="623.5" >t..</text>
+</g>
+<g >
+<title>trx_write_serialisation_history(trx_t*, mtr_t*) (7 samples, 2.70%)</title><rect x="1007.8" y="597" width="31.9" height="15.0" fill="rgb(68,182,182)" rx="2" ry="2" />
+<text  x="1010.76" y="607.5" >tr..</text>
+</g>
+<g >
+<title>tcp_cleanup_rbuf (1 samples, 0.39%)</title><rect x="365.4" y="405" width="4.5" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="368.37" y="415.5" ></text>
+</g>
+<g >
+<title>Fil_shard::do_io(IORequest const&amp;, bool, page_id_t const&amp;, page_size_t const&amp;, unsigned long, unsigned long, void*, void*) (2 samples, 0.77%)</title><rect x="205.9" y="693" width="9.1" height="15.0" fill="rgb(82,194,194)" rx="2" ry="2" />
+<text  x="208.91" y="703.5" ></text>
+</g>
+<g >
+<title>exit_to_user_mode_loop (1 samples, 0.39%)</title><rect x="966.8" y="581" width="4.5" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="969.76" y="591.5" ></text>
+</g>
+<g >
+<title>plugin_foreach_with_mask(THD*, bool (**)(THD*, st_plugin_int*, void*), int, unsigned int, void*) (1 samples, 0.39%)</title><rect x="962.2" y="661" width="4.6" height="15.0" fill="rgb(91,202,202)" rx="2" ry="2" />
+<text  x="965.20" y="671.5" ></text>
+</g>
+<g >
+<title>syscall_enter_from_user_mode (1 samples, 0.39%)</title><rect x="588.6" y="501" width="4.6" height="15.0" fill="rgb(76,188,188)" rx="2" ry="2" />
+<text  x="591.61" y="511.5" ></text>
+</g>
+<g >
+<title>__blk_mq_run_hw_queue (16 samples, 6.18%)</title><rect x="37.3" y="645" width="72.9" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="40.34" y="655.5" >__blk_mq..</text>
+</g>
+<g >
+<title>blk_flush_plug (5 samples, 1.93%)</title><rect x="183.1" y="501" width="22.8" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="186.13" y="511.5" >b..</text>
+</g>
+<g >
+<title>fput_many (1 samples, 0.39%)</title><rect x="410.9" y="613" width="4.6" height="15.0" fill="rgb(96,208,208)" rx="2" ry="2" />
+<text  x="413.93" y="623.5" ></text>
+</g>
+<g >
+<title>ext4_dirty_inode (1 samples, 0.39%)</title><rect x="256.0" y="597" width="4.6" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="259.02" y="607.5" ></text>
+</g>
+<g >
+<title>selinux_ip_postroute (2 samples, 0.77%)</title><rect x="556.7" y="309" width="9.1" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="559.72" y="319.5" ></text>
+</g>
+<g >
+<title>submit_bio_wait (1 samples, 0.39%)</title><rect x="278.8" y="645" width="4.6" height="15.0" fill="rgb(104,214,214)" rx="2" ry="2" />
+<text  x="281.80" y="655.5" ></text>
+</g>
+<g >
+<title>void dd::cache::Dictionary_client::remove_uncommitted_objects&lt;dd::Column_statistics&gt;(bool) (1 samples, 0.39%)</title><rect x="898.4" y="741" width="4.6" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="901.42" y="751.5" ></text>
+</g>
+<g >
+<title>ssl3_read_n (6 samples, 2.32%)</title><rect x="351.7" y="629" width="27.3" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="354.70" y="639.5" >s..</text>
+</g>
+<g >
+<title>mysql_execute_command(THD*, bool) (107 samples, 41.31%)</title><rect x="629.6" y="789" width="487.5" height="15.0" fill="rgb(65,179,179)" rx="2" ry="2" />
+<text  x="632.61" y="799.5" >mysql_execute_command(THD*, bool)</text>
+</g>
+<g >
+<title>SSL_in_init (1 samples, 0.39%)</title><rect x="438.3" y="661" width="4.5" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="441.26" y="671.5" ></text>
+</g>
+<g >
+<title>mysql_lock_tables(THD*, TABLE**, unsigned long, unsigned int) (1 samples, 0.39%)</title><rect x="843.7" y="741" width="4.6" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="846.75" y="751.5" ></text>
+</g>
+<g >
+<title>vp_notify (13 samples, 5.02%)</title><rect x="51.0" y="533" width="59.2" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="54.00" y="543.5" >vp_not..</text>
+</g>
+<g >
+<title>add_pke(TABLE*, THD*, unsigned char const*) (1 samples, 0.39%)</title><rect x="752.6" y="693" width="4.6" height="15.0" fill="rgb(54,168,168)" rx="2" ry="2" />
+<text  x="755.63" y="703.5" ></text>
+</g>
+<g >
+<title>kfree (1 samples, 0.39%)</title><rect x="543.1" y="69" width="4.5" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="546.05" y="79.5" ></text>
+</g>
+<g >
+<title>Trans_delegate::after_commit(THD*, bool) (1 samples, 0.39%)</title><rect x="962.2" y="693" width="4.6" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="965.20" y="703.5" ></text>
+</g>
+<g >
+<title>exit_to_user_mode_prepare (1 samples, 0.39%)</title><rect x="966.8" y="613" width="4.5" height="15.0" fill="rgb(101,211,211)" rx="2" ry="2" />
+<text  x="969.76" y="623.5" ></text>
+</g>
+<g >
+<title>handler::ha_write_row(unsigned char*) (22 samples, 8.49%)</title><rect x="729.8" y="725" width="100.3" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="732.85" y="735.5" >handler::ha_..</text>
+</g>
+<g >
+<title>vio_ssl_write(Vio*, unsigned char const*, unsigned long) (38 samples, 14.67%)</title><rect x="438.3" y="725" width="173.1" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="441.26" y="735.5" >vio_ssl_write(Vio*, un..</text>
+</g>
+<g >
+<title>Lex_input_stream::init(THD*, char const*, unsigned long) (1 samples, 0.39%)</title><rect x="315.3" y="821" width="4.5" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="318.25" y="831.5" ></text>
+</g>
+<g >
+<title>buf_flush_page_coordinator_thread() (8 samples, 3.09%)</title><rect x="178.6" y="853" width="36.4" height="15.0" fill="rgb(94,206,206)" rx="2" ry="2" />
+<text  x="181.57" y="863.5" >buf..</text>
+</g>
+<g >
+<title>__x64_sys_clock_gettime (1 samples, 0.39%)</title><rect x="975.9" y="597" width="4.5" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="978.87" y="607.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (28 samples, 10.81%)</title><rect x="470.2" y="533" width="127.5" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="473.15" y="543.5" >do_syscall_64</text>
+</g>
+<g >
+<title>blk_mq_dispatch_rq_list (16 samples, 6.18%)</title><rect x="37.3" y="581" width="72.9" height="15.0" fill="rgb(91,203,203)" rx="2" ry="2" />
+<text  x="40.34" y="591.5" >blk_mq_d..</text>
+</g>
+<g >
+<title>Double_write::check_block(buf_block_t const*) (1 samples, 0.39%)</title><rect x="178.6" y="725" width="4.5" height="15.0" fill="rgb(102,213,213)" rx="2" ry="2" />
+<text  x="181.57" y="735.5" ></text>
+</g>
+<g >
+<title>grab_cache_page_write_begin (1 samples, 0.39%)</title><rect x="944.0" y="501" width="4.5" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="946.98" y="511.5" ></text>
+</g>
+<g >
+<title>Field::move_field_offset(long) (1 samples, 0.39%)</title><rect x="734.4" y="693" width="4.6" height="15.0" fill="rgb(64,177,177)" rx="2" ry="2" />
+<text  x="737.40" y="703.5" ></text>
+</g>
+<g >
+<title>selinux_xfrm_postroute_last (1 samples, 0.39%)</title><rect x="561.3" y="277" width="4.5" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="564.27" y="287.5" ></text>
+</g>
+<g >
+<title>check_access(THD*, unsigned long, char const*, unsigned long*, GRANT_INTERNAL_INFO*, bool, bool) (1 samples, 0.39%)</title><rect x="661.5" y="709" width="4.6" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="664.51" y="719.5" ></text>
+</g>
+<g >
+<title>syscall_enter_from_user_mode (1 samples, 0.39%)</title><rect x="151.2" y="837" width="4.6" height="15.0" fill="rgb(88,199,199)" rx="2" ry="2" />
+<text  x="154.24" y="847.5" ></text>
+</g>
+<g >
+<title>THD::binlog_query(THD::enum_binlog_query_type, char const*, unsigned long, bool, bool, bool, int) (2 samples, 0.77%)</title><rect x="698.0" y="741" width="9.1" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="700.95" y="751.5" ></text>
+</g>
+<g >
+<title>MDL_context::acquire_lock(MDL_request*, unsigned long) (1 samples, 0.39%)</title><rect x="693.4" y="693" width="4.6" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="696.40" y="703.5" ></text>
+</g>
+<g >
+<title>mtr_t::Command::add_dirty_blocks_to_flush_list(unsigned long, unsigned long) (2 samples, 0.77%)</title><rect x="1053.3" y="565" width="9.1" height="15.0" fill="rgb(92,204,204)" rx="2" ry="2" />
+<text  x="1056.32" y="575.5" ></text>
+</g>
+<g >
+<title>page_cur_search_with_match_bytes(buf_block_t const*, dict_index_t const*, dtuple_t const*, page_cur_mode_t, unsigned long*, unsigned long*, unsigned long*, unsigned long*, page_cur_t*) (2 samples, 0.77%)</title><rect x="807.3" y="613" width="9.1" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="810.30" y="623.5" ></text>
+</g>
+<g >
+<title>EVP_CIPHER_CTX_ctrl (1 samples, 0.39%)</title><rect x="338.0" y="629" width="4.6" height="15.0" fill="rgb(89,201,201)" rx="2" ry="2" />
+<text  x="341.03" y="639.5" ></text>
+</g>
+<g >
+<title>finish_task_switch.isra.0 (3 samples, 1.16%)</title><rect x="164.9" y="725" width="13.7" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="167.90" y="735.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (1 samples, 0.39%)</title><rect x="306.1" y="741" width="4.6" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="309.14" y="751.5" ></text>
+</g>
+<g >
+<title>__ext4_mark_inode_dirty (1 samples, 0.39%)</title><rect x="953.1" y="469" width="4.5" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="956.09" y="479.5" ></text>
+</g>
+<g >
+<title>balance_dirty_pages_ratelimited (1 samples, 0.39%)</title><rect x="930.3" y="501" width="4.6" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="933.31" y="511.5" ></text>
+</g>
+<g >
+<title>buf_page_t::was_stale() const (2 samples, 0.77%)</title><rect x="775.4" y="533" width="9.1" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="778.41" y="543.5" ></text>
+</g>
+<g >
+<title>Commit_order_manager::get_rollback_status(THD*) (1 samples, 0.39%)</title><rect x="1112.5" y="709" width="4.6" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="1115.55" y="719.5" ></text>
+</g>
+<g >
+<title>page_cur_insert_rec_write_log(unsigned char*, unsigned long, unsigned char*, dict_index_t*, mtr_t*) (1 samples, 0.39%)</title><rect x="789.1" y="549" width="4.5" height="15.0" fill="rgb(58,173,173)" rx="2" ry="2" />
+<text  x="792.07" y="559.5" ></text>
+</g>
+<g >
+<title>trx_prepare_for_mysql(trx_t*) (4 samples, 1.54%)</title><rect x="1089.8" y="709" width="18.2" height="15.0" fill="rgb(66,179,179)" rx="2" ry="2" />
+<text  x="1092.77" y="719.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (9 samples, 3.47%)</title><rect x="114.8" y="853" width="41.0" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="117.79" y="863.5" >do_..</text>
+</g>
+<g >
+<title>btr_cur_search_to_nth_level(dict_index_t*, unsigned long, dtuple_t const*, page_cur_mode_t, unsigned long, btr_cur_t*, unsigned long, char const*, unsigned long, mtr_t*) (5 samples, 1.93%)</title><rect x="793.6" y="629" width="22.8" height="15.0" fill="rgb(82,194,194)" rx="2" ry="2" />
+<text  x="796.63" y="639.5" >b..</text>
+</g>
+<g >
+<title>tcp_recvmsg (1 samples, 0.39%)</title><rect x="360.8" y="421" width="4.6" height="15.0" fill="rgb(102,213,213)" rx="2" ry="2" />
+<text  x="363.81" y="431.5" ></text>
+</g>
+<g >
+<title>void dd::cache::Dictionary_client::remove_uncommitted_objects&lt;dd::Charset&gt;(bool) (1 samples, 0.39%)</title><rect x="893.9" y="741" width="4.5" height="15.0" fill="rgb(78,190,190)" rx="2" ry="2" />
+<text  x="896.86" y="751.5" ></text>
+</g>
+<g >
+<title>irqentry_exit_to_user_mode (1 samples, 0.39%)</title><rect x="966.8" y="629" width="4.5" height="15.0" fill="rgb(92,204,204)" rx="2" ry="2" />
+<text  x="969.76" y="639.5" ></text>
+</g>
+<g >
+<title>Buf_fetch_normal::get(buf_block_t*&amp;) (3 samples, 1.16%)</title><rect x="770.8" y="549" width="13.7" height="15.0" fill="rgb(56,171,171)" rx="2" ry="2" />
+<text  x="773.85" y="559.5" ></text>
+</g>
+<g >
+<title>ext4_get_inode_loc (1 samples, 0.39%)</title><rect x="953.1" y="437" width="4.5" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="956.09" y="447.5" ></text>
+</g>
+<g >
+<title>aes_gcm_cipher (1 samples, 0.39%)</title><rect x="597.7" y="565" width="4.6" height="15.0" fill="rgb(78,190,190)" rx="2" ry="2" />
+<text  x="600.72" y="575.5" ></text>
+</g>
+<g >
+<title>__x64_sys_fsync (2 samples, 0.77%)</title><rect x="278.8" y="693" width="9.1" height="15.0" fill="rgb(89,201,201)" rx="2" ry="2" />
+<text  x="281.80" y="703.5" ></text>
+</g>
+<g >
+<title>syscall_exit_to_user_mode (1 samples, 0.39%)</title><rect x="110.2" y="805" width="4.6" height="15.0" fill="rgb(60,175,175)" rx="2" ry="2" />
+<text  x="113.23" y="815.5" ></text>
+</g>
+<g >
+<title>Gtid_table_persistor::save(Gtid_set const*, bool) (1 samples, 0.39%)</title><rect x="228.7" y="805" width="4.5" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="231.69" y="815.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;Detached_thread, void (*)(unsigned long), unsigned long&gt; &gt; &gt;::_M_run() (9 samples, 3.47%)</title><rect x="274.2" y="869" width="41.1" height="15.0" fill="rgb(69,182,182)" rx="2" ry="2" />
+<text  x="277.25" y="879.5" >std..</text>
+</g>
+<g >
+<title>__schedule (1 samples, 0.39%)</title><rect x="406.4" y="581" width="4.5" height="15.0" fill="rgb(106,217,217)" rx="2" ry="2" />
+<text  x="409.37" y="591.5" ></text>
+</g>
+<g >
+<title>sk_stream_alloc_skb (2 samples, 0.77%)</title><rect x="570.4" y="405" width="9.1" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="573.39" y="415.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock_irqrestore (11 samples, 4.25%)</title><rect x="492.9" y="85" width="50.2" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="495.93" y="95.5" >_raw_..</text>
+</g>
+<g >
+<title>lookup_ioctx (1 samples, 0.39%)</title><rect x="28.2" y="773" width="4.6" height="15.0" fill="rgb(60,175,175)" rx="2" ry="2" />
+<text  x="31.22" y="783.5" ></text>
+</g>
+<g >
+<title>__iomap_dio_rw (16 samples, 6.18%)</title><rect x="37.3" y="741" width="72.9" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="40.34" y="751.5" >__iomap_..</text>
+</g>
+<g >
+<title>BIO_write (29 samples, 11.20%)</title><rect x="465.6" y="613" width="132.1" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="468.60" y="623.5" >BIO_write</text>
+</g>
+<g >
+<title>ppoll (4 samples, 1.54%)</title><rect x="397.3" y="709" width="18.2" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="400.26" y="719.5" ></text>
+</g>
+<g >
+<title>Gtid_specification::to_string(Sid_map const*, char*, bool) const (1 samples, 0.39%)</title><rect x="1071.5" y="629" width="4.6" height="15.0" fill="rgb(91,203,203)" rx="2" ry="2" />
+<text  x="1074.54" y="639.5" ></text>
+</g>
+<g >
+<title>Write_rows_log_event::binlog_row_logging_function(THD*, TABLE*, bool, unsigned char const*, unsigned char const*) (1 samples, 0.39%)</title><rect x="748.1" y="693" width="4.5" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="751.07" y="703.5" ></text>
+</g>
+<g >
+<title>ext4_inode_csum_set (1 samples, 0.39%)</title><rect x="925.8" y="405" width="4.5" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="928.75" y="415.5" ></text>
+</g>
+<g >
+<title>EVP_CipherFinal_ex (1 samples, 0.39%)</title><rect x="342.6" y="629" width="4.5" height="15.0" fill="rgb(92,204,204)" rx="2" ry="2" />
+<text  x="345.59" y="639.5" ></text>
+</g>
+<g >
+<title>lex_start(THD*) (1 samples, 0.39%)</title><rect x="620.5" y="789" width="4.6" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="623.50" y="799.5" ></text>
+</g>
+<g >
+<title>generic_perform_write (7 samples, 2.70%)</title><rect x="930.3" y="533" width="31.9" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="933.31" y="543.5" >ge..</text>
+</g>
+<g >
+<title>mtr_t::memo_push(void*, mtr_memo_type_t) (1 samples, 0.39%)</title><rect x="1016.9" y="517" width="4.5" height="15.0" fill="rgb(65,178,178)" rx="2" ry="2" />
+<text  x="1019.87" y="527.5" ></text>
+</g>
+<g >
+<title>PROFILING::start_new_query(char const*) (1 samples, 0.39%)</title><rect x="319.8" y="821" width="4.6" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="322.81" y="831.5" ></text>
+</g>
+<g >
+<title>trx_prepare_low(trx_t*, trx_undo_ptr_t*, bool) (4 samples, 1.54%)</title><rect x="1089.8" y="693" width="18.2" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="1092.77" y="703.5" ></text>
+</g>
+<g >
+<title>Protocol_classic::read_packet() (20 samples, 7.72%)</title><rect x="324.4" y="805" width="91.1" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="327.36" y="815.5" >Protocol_c..</text>
+</g>
+<g >
+<title>blk_mq_submit_bio (1 samples, 0.39%)</title><rect x="278.8" y="613" width="4.6" height="15.0" fill="rgb(106,217,217)" rx="2" ry="2" />
+<text  x="281.80" y="623.5" ></text>
+</g>
+<g >
+<title>LinuxAIOHandler::poll(fil_node_t**, void**, IORequest*) (4 samples, 1.54%)</title><rect x="297.0" y="805" width="18.3" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="300.03" y="815.5" ></text>
+</g>
+<g >
+<title>Binlog_cache_storage::write(unsigned char const*, unsigned long long) (1 samples, 0.39%)</title><rect x="702.5" y="677" width="4.6" height="15.0" fill="rgb(66,179,179)" rx="2" ry="2" />
+<text  x="705.51" y="687.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (8 samples, 3.09%)</title><rect x="114.8" y="837" width="36.4" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="117.79" y="847.5" >__x..</text>
+</g>
+<g >
+<title>kmem_cache_alloc (1 samples, 0.39%)</title><rect x="256.0" y="533" width="4.6" height="15.0" fill="rgb(54,169,169)" rx="2" ry="2" />
+<text  x="259.02" y="543.5" ></text>
+</g>
+<g >
+<title>Buf_fetch&lt;Buf_fetch_normal&gt;::single_page() (1 samples, 0.39%)</title><rect x="1098.9" y="645" width="4.5" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="1101.88" y="655.5" ></text>
+</g>
+<g >
+<title>kvm_clock_get_cycles (1 samples, 0.39%)</title><rect x="369.9" y="357" width="4.6" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="372.92" y="367.5" ></text>
+</g>
+<g >
+<title>syscall_trace_enter.constprop.0 (1 samples, 0.39%)</title><rect x="210.5" y="613" width="4.5" height="15.0" fill="rgb(63,176,176)" rx="2" ry="2" />
+<text  x="213.46" y="623.5" ></text>
+</g>
+<g >
+<title>buf_page_get_gen(page_id_t const&amp;, page_size_t const&amp;, unsigned long, buf_block_t*, Page_fetch, ut::Location, mtr_t*, bool) (1 samples, 0.39%)</title><rect x="1048.8" y="597" width="4.5" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="1051.76" y="607.5" ></text>
+</g>
+<g >
+<title>futex_wait (3 samples, 1.16%)</title><rect x="164.9" y="805" width="13.7" height="15.0" fill="rgb(98,209,209)" rx="2" ry="2" />
+<text  x="167.90" y="815.5" ></text>
+</g>
+<g >
+<title>MYSQLparse(THD*, Parse_tree_root**) (9 samples, 3.47%)</title><rect x="1135.3" y="757" width="41.0" height="15.0" fill="rgb(68,181,181)" rx="2" ry="2" />
+<text  x="1138.33" y="767.5" >MYS..</text>
+</g>
+<g >
+<title>do_futex (1 samples, 0.39%)</title><rect x="306.1" y="725" width="4.6" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="309.14" y="735.5" ></text>
+</g>
+<g >
+<title>blk_mq_sched_insert_requests (16 samples, 6.18%)</title><rect x="37.3" y="677" width="72.9" height="15.0" fill="rgb(92,204,204)" rx="2" ry="2" />
+<text  x="40.34" y="687.5" >blk_mq_s..</text>
+</g>
+<g >
+<title>new_sync_write (5 samples, 1.93%)</title><rect x="183.1" y="581" width="22.8" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="186.13" y="591.5" >n..</text>
+</g>
+<g >
+<title>kmem_cache_alloc (1 samples, 0.39%)</title><rect x="948.5" y="437" width="4.6" height="15.0" fill="rgb(90,201,201)" rx="2" ry="2" />
+<text  x="951.53" y="447.5" ></text>
+</g>
+<g >
+<title>__x64_sys_pwrite64 (5 samples, 1.93%)</title><rect x="183.1" y="613" width="22.8" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="186.13" y="623.5" >_..</text>
+</g>
+<g >
+<title>do_futex (8 samples, 3.09%)</title><rect x="114.8" y="821" width="36.4" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="117.79" y="831.5" >do_..</text>
+</g>
+<g >
+<title>open_tables(THD*, TABLE_LIST**, unsigned int*, unsigned int, Prelocking_strategy*) (6 samples, 2.32%)</title><rect x="670.6" y="725" width="27.4" height="15.0" fill="rgb(91,203,203)" rx="2" ry="2" />
+<text  x="673.62" y="735.5" >o..</text>
+</g>
+<g >
+<title>mtr_t::commit() (2 samples, 0.77%)</title><rect x="1053.3" y="597" width="9.1" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="1056.32" y="607.5" ></text>
+</g>
+<g >
+<title>read (6 samples, 2.32%)</title><rect x="351.7" y="565" width="27.3" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="354.70" y="575.5" >r..</text>
+</g>
+<g >
+<title>EVP_EncryptUpdate (1 samples, 0.39%)</title><rect x="597.7" y="597" width="4.6" height="15.0" fill="rgb(64,177,177)" rx="2" ry="2" />
+<text  x="600.72" y="607.5" ></text>
+</g>
+<g >
+<title>flst_add_first(unsigned char*, unsigned char*, mtr_t*) (4 samples, 1.54%)</title><rect x="1021.4" y="549" width="18.3" height="15.0" fill="rgb(76,188,188)" rx="2" ry="2" />
+<text  x="1024.43" y="559.5" ></text>
+</g>
+<g >
+<title>skb_release_data (1 samples, 0.39%)</title><rect x="543.1" y="85" width="4.5" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="546.05" y="95.5" ></text>
+</g>
+<g >
+<title>execute_native_thread_routine (30 samples, 11.58%)</title><rect x="178.6" y="885" width="136.7" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="181.57" y="895.5" >execute_native_th..</text>
+</g>
+<g >
+<title>__tcp_transmit_skb (22 samples, 8.49%)</title><rect x="470.2" y="373" width="100.2" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="473.15" y="383.5" >__tcp_transm..</text>
+</g>
+<g >
+<title>flst_insert_before(unsigned char*, unsigned char*, unsigned char*, mtr_t*) (3 samples, 1.16%)</title><rect x="1026.0" y="533" width="13.7" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="1028.98" y="543.5" ></text>
+</g>
+<g >
+<title>page_copy_rec_list_end_to_created_page(unsigned char*, unsigned char*, dict_index_t*, mtr_t*) (1 samples, 0.39%)</title><rect x="789.1" y="565" width="4.5" height="15.0" fill="rgb(69,182,182)" rx="2" ry="2" />
+<text  x="792.07" y="575.5" ></text>
+</g>
+<g >
+<title>PolicyMutex&lt;TTASEventMutex&lt;GenericPolicy&gt; &gt;::enter(unsigned int, unsigned int, char const*, unsigned int) (1 samples, 0.39%)</title><rect x="287.9" y="757" width="4.6" height="15.0" fill="rgb(103,213,213)" rx="2" ry="2" />
+<text  x="290.92" y="767.5" ></text>
+</g>
+<g >
+<title>dispatch_command(THD*, COM_DATA const*, enum_server_command) (169 samples, 65.25%)</title><rect x="415.5" y="821" width="769.9" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="418.48" y="831.5" >dispatch_command(THD*, COM_DATA const*, enum_server_command)</text>
+</g>
+<g >
+<title>__x64_sys_clock_gettime (1 samples, 0.39%)</title><rect x="975.9" y="581" width="4.5" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="978.87" y="591.5" ></text>
+</g>
+<g >
+<title>tcp_mstamp_refresh (1 samples, 0.39%)</title><rect x="369.9" y="389" width="4.6" height="15.0" fill="rgb(82,194,194)" rx="2" ry="2" />
+<text  x="372.92" y="399.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;Detached_thread, void (*)()&gt; &gt; &gt;::_M_run() (10 samples, 3.86%)</title><rect x="178.6" y="869" width="45.5" height="15.0" fill="rgb(55,169,169)" rx="2" ry="2" />
+<text  x="181.57" y="879.5" >std:..</text>
+</g>
+<g >
+<title>sock_recvmsg (1 samples, 0.39%)</title><rect x="374.5" y="437" width="4.5" height="15.0" fill="rgb(54,168,168)" rx="2" ry="2" />
+<text  x="377.48" y="447.5" ></text>
+</g>
+<g >
+<title>trans_commit_stmt(THD*, bool) (2 samples, 0.77%)</title><rect x="1108.0" y="773" width="9.1" height="15.0" fill="rgb(93,204,204)" rx="2" ry="2" />
+<text  x="1110.99" y="783.5" ></text>
+</g>
+<g >
+<title>vio_socket_io_wait(Vio*, enum_vio_io_event) (4 samples, 1.54%)</title><rect x="397.3" y="725" width="18.2" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="400.26" y="735.5" ></text>
+</g>
+<g >
+<title>fput_many (1 samples, 0.39%)</title><rect x="356.3" y="485" width="4.5" height="15.0" fill="rgb(98,209,209)" rx="2" ry="2" />
+<text  x="359.25" y="495.5" ></text>
+</g>
+<g >
+<title>mysqld (259 samples, 100.00%)</title><rect x="10.0" y="901" width="1180.0" height="15.0" fill="rgb(101,211,211)" rx="2" ry="2" />
+<text  x="13.00" y="911.5" >mysqld</text>
+</g>
+<g >
+<title>ext4_mark_iloc_dirty (2 samples, 0.77%)</title><rect x="921.2" y="453" width="9.1" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="924.20" y="463.5" ></text>
+</g>
+<g >
+<title>__rcu_read_unlock (1 samples, 0.39%)</title><rect x="953.1" y="389" width="4.5" height="15.0" fill="rgb(96,208,208)" rx="2" ry="2" />
+<text  x="956.09" y="399.5" ></text>
+</g>
+<g >
+<title>__blk_mq_sched_dispatch_requests (16 samples, 6.18%)</title><rect x="37.3" y="613" width="72.9" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="40.34" y="623.5" >__blk_mq..</text>
+</g>
+<g >
+<title>syscall_exit_to_user_mode_prepare (1 samples, 0.39%)</title><rect x="980.4" y="581" width="4.6" height="15.0" fill="rgb(65,179,179)" rx="2" ry="2" />
+<text  x="983.42" y="591.5" ></text>
+</g>
+<g >
+<title>_raw_spin_unlock_irqrestore (1 samples, 0.39%)</title><rect x="306.1" y="661" width="4.6" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="309.14" y="671.5" ></text>
+</g>
+<g >
+<title>log_flusher(log_t*) (1 samples, 0.39%)</title><rect x="233.2" y="853" width="4.6" height="15.0" fill="rgb(67,181,181)" rx="2" ry="2" />
+<text  x="236.24" y="863.5" ></text>
+</g>
+<g >
+<title>write_record(THD*, TABLE*, COPY_INFO*, COPY_INFO*) (23 samples, 8.88%)</title><rect x="725.3" y="741" width="104.8" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="728.29" y="751.5" >write_record..</text>
+</g>
+<g >
+<title>mtr_t::Command::execute() (2 samples, 0.77%)</title><rect x="1053.3" y="581" width="9.1" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="1056.32" y="591.5" ></text>
+</g>
+<g >
+<title>mlog_write_ulint(unsigned char*, unsigned long, mlog_id_t, mtr_t*) (1 samples, 0.39%)</title><rect x="1103.4" y="661" width="4.6" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="1106.44" y="671.5" ></text>
+</g>
+<g >
+<title>net_write_packet(NET*, unsigned char const*, unsigned long) (40 samples, 15.44%)</title><rect x="429.2" y="741" width="182.2" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="432.15" y="751.5" >net_write_packet(NET*, ..</text>
+</g>
+<g >
+<title>decimal2double(decimal_t const*, double*) (1 samples, 0.39%)</title><rect x="716.2" y="677" width="4.5" height="15.0" fill="rgb(80,192,192)" rx="2" ry="2" />
+<text  x="719.18" y="687.5" ></text>
+</g>
+<g >
+<title>inet6_recvmsg (3 samples, 1.16%)</title><rect x="360.8" y="453" width="13.7" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="363.81" y="463.5" ></text>
+</g>
+<g >
+<title>balance_dirty_pages_ratelimited (1 samples, 0.39%)</title><rect x="930.3" y="517" width="4.6" height="15.0" fill="rgb(74,187,187)" rx="2" ry="2" />
+<text  x="933.31" y="527.5" ></text>
+</g>
+<g >
+<title>ha_innobase::extra(ha_extra_function) (1 samples, 0.39%)</title><rect x="684.3" y="709" width="4.5" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="687.29" y="719.5" ></text>
+</g>
+<g >
+<title>ext4_es_lookup_extent (1 samples, 0.39%)</title><rect x="32.8" y="741" width="4.5" height="15.0" fill="rgb(95,207,207)" rx="2" ry="2" />
+<text  x="35.78" y="751.5" ></text>
+</g>
+<g >
+<title>dev_hard_start_xmit (2 samples, 0.77%)</title><rect x="474.7" y="309" width="9.1" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="477.71" y="319.5" ></text>
+</g>
+<g >
+<title>Gtid_table_persistor::write_row(TABLE*, char const*, long, long) (1 samples, 0.39%)</title><rect x="228.7" y="773" width="4.5" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="231.69" y="783.5" ></text>
+</g>
+<g >
+<title>os_file_write_page(IORequest&amp;, char const*, int, unsigned char const*, unsigned long, unsigned long, file::Block const*) (5 samples, 1.93%)</title><rect x="183.1" y="677" width="22.8" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="186.13" y="687.5" >o..</text>
+</g>
+<g >
+<title>vfs_write (10 samples, 3.86%)</title><rect x="916.6" y="581" width="45.6" height="15.0" fill="rgb(88,199,199)" rx="2" ry="2" />
+<text  x="919.64" y="591.5" >vfs_..</text>
+</g>
+<g >
+<title>do_poll.constprop.0 (3 samples, 1.16%)</title><rect x="397.3" y="629" width="13.6" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="400.26" y="639.5" ></text>
+</g>
+<g >
+<title>__mark_inode_dirty (2 samples, 0.77%)</title><rect x="948.5" y="501" width="9.1" height="15.0" fill="rgb(65,179,179)" rx="2" ry="2" />
+<text  x="951.53" y="511.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__si_class_type_info::__do_dyncast(long, __cxxabiv1::__class_type_info::__sub_kind, __cxxabiv1::__class_type_info const*, void const*, __cxxabiv1::__class_type_info const*, void const*, __cxxabiv1::__class_type_info::__dyncast_result&amp;) const (1 samples, 0.39%)</title><rect x="14.6" y="837" width="4.5" height="15.0" fill="rgb(105,215,215)" rx="2" ry="2" />
+<text  x="17.56" y="847.5" ></text>
+</g>
+<g >
+<title>THD::decide_logging_format(TABLE_LIST*) (1 samples, 0.39%)</title><rect x="834.6" y="741" width="4.6" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="837.63" y="751.5" ></text>
+</g>
+<g >
+<title>__strcmp_avx2 (1 samples, 0.39%)</title><rect x="19.1" y="837" width="4.6" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="22.11" y="847.5" ></text>
+</g>
+<g >
+<title>ext4_es_insert_delayed_block (1 samples, 0.39%)</title><rect x="934.9" y="453" width="4.5" height="15.0" fill="rgb(103,213,213)" rx="2" ry="2" />
+<text  x="937.86" y="463.5" ></text>
+</g>
+<g >
+<title>void ut_list_remove&lt;ut_list_base&lt;trx_undo_t, trx_undo_t_undo_list_node_getter&gt; &gt;(ut_list_base&lt;trx_undo_t, trx_undo_t_undo_list_node_getter&gt;&amp;, ut_list_base&lt;trx_undo_t, trx_undo_t_undo_list_node_getter&gt;::elem_type*) (1 samples, 0.39%)</title><rect x="784.5" y="597" width="4.6" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="787.52" y="607.5" ></text>
+</g>
+<g >
+<title>innobase_xa_prepare(handlerton*, THD*, bool) (4 samples, 1.54%)</title><rect x="1089.8" y="725" width="18.2" height="15.0" fill="rgb(80,192,192)" rx="2" ry="2" />
+<text  x="1092.77" y="735.5" ></text>
+</g>
+<g >
+<title>blk_mq_sched_dispatch_requests (4 samples, 1.54%)</title><rect x="183.1" y="421" width="18.3" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="186.13" y="431.5" ></text>
+</g>
+<g >
+<title>dispatch_sql_command(THD*, Parser_state*) (124 samples, 47.88%)</title><rect x="615.9" y="805" width="565.0" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="618.95" y="815.5" >dispatch_sql_command(THD*, Parser_state*)</text>
+</g>
+<g >
+<title>trans_has_updated_trans_table(THD const*) (1 samples, 0.39%)</title><rect x="848.3" y="741" width="4.6" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="851.30" y="751.5" ></text>
+</g>
+<g >
+<title>buf_page_make_young_if_needed(buf_page_t*) (1 samples, 0.39%)</title><rect x="766.3" y="565" width="4.5" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="769.29" y="575.5" ></text>
+</g>
+<g >
+<title>__wake_up_common_lock (11 samples, 4.25%)</title><rect x="492.9" y="117" width="50.2" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="495.93" y="127.5" >__wak..</text>
+</g>
+<g >
+<title>EVP_CipherFinal_ex (1 samples, 0.39%)</title><rect x="379.0" y="613" width="4.6" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="382.03" y="623.5" ></text>
+</g>
+<g >
+<title>iowrite16 (13 samples, 5.02%)</title><rect x="51.0" y="501" width="59.2" height="15.0" fill="rgb(56,171,171)" rx="2" ry="2" />
+<text  x="54.00" y="511.5" >iowrit..</text>
+</g>
+<g >
+<title>sk_stream_alloc_skb (1 samples, 0.39%)</title><rect x="574.9" y="389" width="4.6" height="15.0" fill="rgb(80,192,192)" rx="2" ry="2" />
+<text  x="577.94" y="399.5" ></text>
+</g>
+<g >
+<title>plugin_foreach_with_mask(THD*, bool (*)(THD*, st_plugin_int*, void*), int, unsigned int, void*) (1 samples, 0.39%)</title><rect x="1085.2" y="709" width="4.6" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="1088.21" y="719.5" ></text>
+</g>
+<g >
+<title>AIO::reserve_slot(IORequest&amp;, fil_node_t*, void*, pfs_os_file_t, char const*, void*, unsigned long, unsigned long, file::Block const*) (1 samples, 0.39%)</title><rect x="205.9" y="661" width="4.6" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="208.91" y="671.5" ></text>
+</g>
+<g >
+<title>Double_write::write_to_datafile(buf_page_t const*, bool, file::Block const*) (2 samples, 0.77%)</title><rect x="205.9" y="725" width="9.1" height="15.0" fill="rgb(68,181,181)" rx="2" ry="2" />
+<text  x="208.91" y="735.5" ></text>
+</g>
+<g >
+<title>blk_finish_plug (16 samples, 6.18%)</title><rect x="37.3" y="725" width="72.9" height="15.0" fill="rgb(103,213,213)" rx="2" ry="2" />
+<text  x="40.34" y="735.5" >blk_fini..</text>
+</g>
+<g >
+<title>__errno_location (1 samples, 0.39%)</title><rect x="461.0" y="629" width="4.6" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="464.04" y="639.5" ></text>
+</g>
+<g >
+<title>bitmap_init(MY_BITMAP*, unsigned int*, unsigned int) (1 samples, 0.39%)</title><rect x="748.1" y="613" width="4.5" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="751.07" y="623.5" ></text>
+</g>
+<g >
+<title>__clock_gettime (1 samples, 0.39%)</title><rect x="912.1" y="725" width="4.5" height="15.0" fill="rgb(90,201,201)" rx="2" ry="2" />
+<text  x="915.08" y="735.5" ></text>
+</g>
+<g >
+<title>buf_flush_page(buf_pool_t*, buf_page_t*, buf_flush_t, bool) (8 samples, 3.09%)</title><rect x="178.6" y="789" width="36.4" height="15.0" fill="rgb(56,170,170)" rx="2" ry="2" />
+<text  x="181.57" y="799.5" >buf..</text>
+</g>
+<g >
+<title>ext4_fill_raw_inode (2 samples, 0.77%)</title><rect x="921.2" y="421" width="9.1" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="924.20" y="431.5" ></text>
+</g>
+<g >
+<title>mysql_audit_notify(THD*, mysql_event_parse_subclass_t, char const*, mysql_event_parse_rewrite_plugin_flag*, MYSQL_LEX_CSTRING*) (1 samples, 0.39%)</title><rect x="625.1" y="789" width="4.5" height="15.0" fill="rgb(65,179,179)" rx="2" ry="2" />
+<text  x="628.06" y="799.5" ></text>
+</g>
+<g >
+<title>ext4_da_map_blocks.constprop.0 (1 samples, 0.39%)</title><rect x="934.9" y="469" width="4.5" height="15.0" fill="rgb(65,179,179)" rx="2" ry="2" />
+<text  x="937.86" y="479.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (5 samples, 1.93%)</title><rect x="246.9" y="725" width="22.8" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="249.91" y="735.5" >d..</text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.39%)</title><rect x="210.5" y="629" width="4.5" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="213.46" y="639.5" ></text>
+</g>
+<g >
+<title>exit_to_user_mode_loop (1 samples, 0.39%)</title><rect x="966.8" y="597" width="4.5" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="969.76" y="607.5" ></text>
+</g>
+<g >
+<title>tcp_skb_entail (1 samples, 0.39%)</title><rect x="579.5" y="405" width="4.6" height="15.0" fill="rgb(93,205,205)" rx="2" ry="2" />
+<text  x="582.50" y="415.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (4 samples, 1.54%)</title><rect x="160.3" y="853" width="18.3" height="15.0" fill="rgb(76,188,188)" rx="2" ry="2" />
+<text  x="163.35" y="863.5" ></text>
+</g>
+<g >
+<title>enqueue_to_backlog (1 samples, 0.39%)</title><rect x="479.3" y="245" width="4.5" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="482.27" y="255.5" ></text>
+</g>
+<g >
+<title>Buf_fetch&lt;Buf_fetch_normal&gt;::lookup() (1 samples, 0.39%)</title><rect x="1098.9" y="629" width="4.5" height="15.0" fill="rgb(89,201,201)" rx="2" ry="2" />
+<text  x="1101.88" y="639.5" ></text>
+</g>
+<g >
+<title>MDL_context::acquire_lock(MDL_request*, unsigned long) (1 samples, 0.39%)</title><rect x="912.1" y="741" width="4.5" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="915.08" y="751.5" ></text>
+</g>
+<g >
+<title>[unknown] (23 samples, 8.88%)</title><rect x="10.0" y="885" width="104.8" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="13.00" y="895.5" >[unknown]</text>
+</g>
+<g >
+<title>page_simple_validate_new(unsigned char const*) (1 samples, 0.39%)</title><rect x="178.6" y="709" width="4.5" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="181.57" y="719.5" ></text>
+</g>
+<g >
+<title>__schedule (1 samples, 0.39%)</title><rect x="593.2" y="453" width="4.5" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="596.17" y="463.5" ></text>
+</g>
+<g >
+<title>MYSQLlex(YYSTYPE*, YYLTYPE*, THD*) (4 samples, 1.54%)</title><rect x="1149.0" y="741" width="18.2" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="1152.00" y="751.5" ></text>
+</g>
+<g >
+<title>check_schema_readonly(THD*, char const*, TABLE_SHARE*) (1 samples, 0.39%)</title><rect x="839.2" y="741" width="4.5" height="15.0" fill="rgb(52,166,166)" rx="2" ry="2" />
+<text  x="842.19" y="751.5" ></text>
+</g>
+<g >
+<title>__mark_inode_dirty (1 samples, 0.39%)</title><rect x="256.0" y="613" width="4.6" height="15.0" fill="rgb(80,192,192)" rx="2" ry="2" />
+<text  x="259.02" y="623.5" ></text>
+</g>
+<g >
+<title>find_keyword(Lex_input_stream*, unsigned int, bool) (2 samples, 0.77%)</title><rect x="1158.1" y="709" width="9.1" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="1161.11" y="719.5" ></text>
+</g>
+<g >
+<title>do_ssl3_write (35 samples, 13.51%)</title><rect x="447.4" y="645" width="159.4" height="15.0" fill="rgb(93,204,204)" rx="2" ry="2" />
+<text  x="450.37" y="655.5" >do_ssl3_write</text>
+</g>
+<g >
+<title>trx_undo_set_state_at_finish(trx_undo_t*, mtr_t*) (1 samples, 0.39%)</title><rect x="1007.8" y="581" width="4.5" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="1010.76" y="591.5" ></text>
+</g>
+<g >
+<title>selinux_ipv4_postroute (1 samples, 0.39%)</title><rect x="565.8" y="309" width="4.6" height="15.0" fill="rgb(68,182,182)" rx="2" ry="2" />
+<text  x="568.83" y="319.5" ></text>
+</g>
+<g >
+<title>os_file_write_page(IORequest&amp;, char const*, int, unsigned char const*, unsigned long, unsigned long, file::Block const*) (5 samples, 1.93%)</title><rect x="246.9" y="773" width="22.8" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="249.91" y="783.5" >o..</text>
+</g>
+<g >
+<title>row_ins_clust_index_entry_low(unsigned int, unsigned long, dict_index_t*, unsigned long, dtuple_t*, que_thr_t*, bool) (15 samples, 5.79%)</title><rect x="757.2" y="645" width="68.3" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="760.18" y="655.5" >row_ins..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (6 samples, 2.32%)</title><rect x="351.7" y="549" width="27.3" height="15.0" fill="rgb(55,169,169)" rx="2" ry="2" />
+<text  x="354.70" y="559.5" >e..</text>
+</g>
+<g >
+<title>Double_write::write_pages(buf_flush_t) (7 samples, 2.70%)</title><rect x="183.1" y="741" width="31.9" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="186.13" y="751.5" >Do..</text>
+</g>
+<g >
+<title>repl_semi_report_begin(Trans_param*, int&amp;) (1 samples, 0.39%)</title><rect x="889.3" y="757" width="4.6" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="892.31" y="767.5" ></text>
+</g>
+<g >
+<title>Trans_delegate::trans_begin(THD*, int&amp;) (2 samples, 0.77%)</title><rect x="880.2" y="757" width="9.1" height="15.0" fill="rgb(105,215,215)" rx="2" ry="2" />
+<text  x="883.19" y="767.5" ></text>
+</g>
+<g >
+<title>__ip_finish_output (1 samples, 0.39%)</title><rect x="470.2" y="341" width="4.5" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="473.15" y="351.5" ></text>
+</g>
+<g >
+<title>ha_commit_trans(THD*, bool, bool) (43 samples, 16.60%)</title><rect x="912.1" y="757" width="195.9" height="15.0" fill="rgb(89,201,201)" rx="2" ry="2" />
+<text  x="915.08" y="767.5" >ha_commit_trans(THD*, boo..</text>
+</g>
+<g >
+<title>PT_item_list::contextualize(Parse_context*) (1 samples, 0.39%)</title><rect x="1121.7" y="725" width="4.5" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="1124.66" y="735.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb_one_core (15 samples, 5.79%)</title><rect x="483.8" y="229" width="68.4" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="486.82" y="239.5" >__netif..</text>
+</g>
+<g >
+<title>binlog::monitoring::Transaction_compression::update(binlog::monitoring::log_type, binary_log::transaction::compression::type, Gtid&amp;, unsigned long, unsigned long, unsigned long, Sid_map*) (2 samples, 0.77%)</title><rect x="1071.5" y="645" width="9.2" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="1074.54" y="655.5" ></text>
+</g>
+<g >
+<title>__write (10 samples, 3.86%)</title><rect x="916.6" y="645" width="45.6" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="919.64" y="655.5" >__wr..</text>
+</g>
+<g >
+<title>__napi_poll (15 samples, 5.79%)</title><rect x="483.8" y="261" width="68.4" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="486.82" y="271.5" >__napi_..</text>
+</g>
+<g >
+<title>SSL_write (1 samples, 0.39%)</title><rect x="433.7" y="725" width="4.6" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="436.71" y="735.5" ></text>
+</g>
+<g >
+<title>my_convert(char*, unsigned long, CHARSET_INFO const*, char const*, unsigned long, CHARSET_INFO const*, unsigned int*) (1 samples, 0.39%)</title><rect x="1167.2" y="725" width="4.6" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="1170.22" y="735.5" ></text>
+</g>
+<g >
+<title>__GI___pwrite (5 samples, 1.93%)</title><rect x="183.1" y="661" width="22.8" height="15.0" fill="rgb(83,195,195)" rx="2" ry="2" />
+<text  x="186.13" y="671.5" >_..</text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.39%)</title><rect x="825.5" y="645" width="4.6" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="828.52" y="655.5" ></text>
+</g>
+<g >
+<title>ext4_reserve_inode_write (1 samples, 0.39%)</title><rect x="953.1" y="453" width="4.5" height="15.0" fill="rgb(67,181,181)" rx="2" ry="2" />
+<text  x="956.09" y="463.5" ></text>
+</g>
+<g >
+<title>Gtid_table_persistor::save(TABLE*, Gtid_set const*) (1 samples, 0.39%)</title><rect x="228.7" y="789" width="4.5" height="15.0" fill="rgb(105,216,216)" rx="2" ry="2" />
+<text  x="231.69" y="799.5" ></text>
+</g>
+<g >
+<title>mtr_t::Command::execute() (1 samples, 0.39%)</title><rect x="985.0" y="581" width="4.5" height="15.0" fill="rgb(93,205,205)" rx="2" ry="2" />
+<text  x="987.98" y="591.5" ></text>
+</g>
+<g >
+<title>Opt_trace_start::Opt_trace_start(THD*, TABLE_LIST*, enum_sql_command, List&lt;set_var_base&gt;*, char const*, unsigned long, sp_printable*, CHARSET_INFO const*) (1 samples, 0.39%)</title><rect x="634.2" y="773" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="637.17" y="783.5" ></text>
+</g>
+<g >
+<title>Table_map_log_event::init_metadata_fields() (1 samples, 0.39%)</title><rect x="743.5" y="661" width="4.6" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="746.51" y="671.5" ></text>
+</g>
+<g >
+<title>ha_commit_low(THD*, bool, bool) (19 samples, 7.34%)</title><rect x="975.9" y="693" width="86.5" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="978.87" y="703.5" >ha_commit_..</text>
+</g>
+<g >
+<title>trx_commit(trx_t*) (12 samples, 4.63%)</title><rect x="985.0" y="629" width="54.7" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="987.98" y="639.5" >trx_c..</text>
+</g>
+<g >
+<title>Field_real::store_decimal(my_decimal const*) (2 samples, 0.77%)</title><rect x="711.6" y="693" width="9.1" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="714.62" y="703.5" ></text>
+</g>
+<g >
+<title>my_net_read(NET*) (20 samples, 7.72%)</title><rect x="324.4" y="789" width="91.1" height="15.0" fill="rgb(54,168,168)" rx="2" ry="2" />
+<text  x="327.36" y="799.5" >my_net_rea..</text>
+</g>
+<g >
+<title>__alloc_skb (1 samples, 0.39%)</title><rect x="570.4" y="389" width="4.5" height="15.0" fill="rgb(67,180,180)" rx="2" ry="2" />
+<text  x="573.39" y="399.5" ></text>
+</g>
+<g >
+<title>enqueue_to_backlog (1 samples, 0.39%)</title><rect x="479.3" y="229" width="4.5" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="482.27" y="239.5" ></text>
+</g>
+<g >
+<title>generic_update_time (1 samples, 0.39%)</title><rect x="256.0" y="629" width="4.6" height="15.0" fill="rgb(103,213,213)" rx="2" ry="2" />
+<text  x="259.02" y="639.5" ></text>
+</g>
+<g >
+<title>tcp_rcv_established (13 samples, 5.02%)</title><rect x="492.9" y="149" width="59.3" height="15.0" fill="rgb(56,171,171)" rx="2" ry="2" />
+<text  x="495.93" y="159.5" >tcp_rc..</text>
+</g>
+<g >
+<title>LinuxAIOHandler::find_completed_slot(unsigned long*) (2 samples, 0.77%)</title><rect x="297.0" y="789" width="9.1" height="15.0" fill="rgb(56,170,170)" rx="2" ry="2" />
+<text  x="300.03" y="799.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 0.39%)</title><rect x="825.5" y="661" width="4.6" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="828.52" y="671.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4 samples, 1.54%)</title><rect x="160.3" y="869" width="18.3" height="15.0" fill="rgb(105,215,215)" rx="2" ry="2" />
+<text  x="163.35" y="879.5" ></text>
+</g>
+<g >
+<title>trx_undo_assign_undo(trx_t*, trx_undo_ptr_t*, unsigned long) (4 samples, 1.54%)</title><rect x="1044.2" y="613" width="18.2" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="1047.21" y="623.5" ></text>
+</g>
+<g >
+<title>IO_CACHE_ostream::flush() (10 samples, 3.86%)</title><rect x="916.6" y="693" width="45.6" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="919.64" y="703.5" >IO_C..</text>
+</g>
+<g >
+<title>tcp_cleanup_rbuf (1 samples, 0.39%)</title><rect x="365.4" y="389" width="4.5" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="368.37" y="399.5" ></text>
+</g>
+<g >
+<title>trx_commit_for_mysql(trx_t*) (17 samples, 6.56%)</title><rect x="985.0" y="645" width="77.4" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="987.98" y="655.5" >trx_comm..</text>
+</g>
+<g >
+<title>Double_write::enqueue(buf_flush_t, buf_page_t*, file::Block const*) (8 samples, 3.09%)</title><rect x="178.6" y="757" width="36.4" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="181.57" y="767.5" >Dou..</text>
+</g>
+<g >
+<title>do_futex (1 samples, 0.39%)</title><rect x="160.3" y="805" width="4.6" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="163.35" y="815.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::ordered_commit(THD*, bool, bool) (37 samples, 14.29%)</title><rect x="916.6" y="725" width="168.6" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="919.64" y="735.5" >MYSQL_BIN_LOG::ordere..</text>
+</g>
+<g >
+<title>trx_commit_low(trx_t*, mtr_t*) (12 samples, 4.63%)</title><rect x="985.0" y="613" width="54.7" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="987.98" y="623.5" >trx_c..</text>
+</g>
+<g >
+<title>cmp_whole_field(unsigned long, unsigned long, bool, unsigned char const*, unsigned int, unsigned char const*, unsigned int) (1 samples, 0.39%)</title><rect x="228.7" y="645" width="4.5" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="231.69" y="655.5" ></text>
+</g>
+<g >
+<title>THD::convert_string(MYSQL_LEX_STRING*, CHARSET_INFO const*, char const*, unsigned long, CHARSET_INFO const*, bool) (1 samples, 0.39%)</title><rect x="1167.2" y="741" width="4.6" height="15.0" fill="rgb(52,167,167)" rx="2" ry="2" />
+<text  x="1170.22" y="751.5" ></text>
+</g>
+<g >
+<title>MEM_ROOT::AllocSlow(unsigned long) (1 samples, 0.39%)</title><rect x="1117.1" y="725" width="4.6" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="1120.10" y="735.5" ></text>
+</g>
+<g >
+<title>Batch_segment::write(dblwr::Buffer const&amp;) (5 samples, 1.93%)</title><rect x="183.1" y="725" width="22.8" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="186.13" y="735.5" >B..</text>
+</g>
+<g >
+<title>Double_write::write_complete(buf_page_t*, buf_flush_t) (4 samples, 1.54%)</title><rect x="274.2" y="805" width="18.3" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="277.25" y="815.5" ></text>
+</g>
+<g >
+<title>generic_update_time (3 samples, 1.16%)</title><rect x="916.6" y="517" width="13.7" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="919.64" y="527.5" ></text>
+</g>
+<g >
+<title>tls13_enc (3 samples, 1.16%)</title><rect x="379.0" y="629" width="13.7" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="382.03" y="639.5" ></text>
+</g>
+<g >
+<title>xas_load (1 samples, 0.39%)</title><rect x="944.0" y="469" width="4.5" height="15.0" fill="rgb(67,181,181)" rx="2" ry="2" />
+<text  x="946.98" y="479.5" ></text>
+</g>
+<g >
+<title>row_ins_step(que_thr_t*) (15 samples, 5.79%)</title><rect x="757.2" y="677" width="68.3" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="760.18" y="687.5" >row_ins..</text>
+</g>
+<g >
+<title>__GI___pwrite (5 samples, 1.93%)</title><rect x="246.9" y="757" width="22.8" height="15.0" fill="rgb(91,203,203)" rx="2" ry="2" />
+<text  x="249.91" y="767.5" >_..</text>
+</g>
+<g >
+<title>Write_rows_log_event::Write_rows_log_event(THD*, TABLE*, Table_id const&amp;, bool, unsigned char const*) (1 samples, 0.39%)</title><rect x="748.1" y="645" width="4.5" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="751.07" y="655.5" ></text>
+</g>
+<g >
+<title>int my_strnncoll_uca&lt;uca_scanner_900&lt;Mb_wc_utf8mb4, 1&gt;, 1, Mb_wc_utf8mb4&gt;(CHARSET_INFO const*, Mb_wc_utf8mb4, unsigned char const*, unsigned long, unsigned char const*, unsigned long, bool) [clone .constprop.179] (1 samples, 0.39%)</title><rect x="228.7" y="629" width="4.5" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="231.69" y="639.5" ></text>
+</g>
+<g >
+<title>page_move_rec_list_end(buf_block_t*, buf_block_t*, unsigned char*, dict_index_t*, mtr_t*) (1 samples, 0.39%)</title><rect x="789.1" y="597" width="4.5" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="792.07" y="607.5" ></text>
+</g>
+<g >
+<title>do_softirq (16 samples, 6.18%)</title><rect x="483.8" y="309" width="72.9" height="15.0" fill="rgb(68,181,181)" rx="2" ry="2" />
+<text  x="486.82" y="319.5" >do_softirq</text>
+</g>
+<g >
+<title>Lex_hash::get_hash_symbol(char const*, unsigned int) const (2 samples, 0.77%)</title><rect x="1158.1" y="693" width="9.1" height="15.0" fill="rgb(72,185,185)" rx="2" ry="2" />
+<text  x="1161.11" y="703.5" ></text>
+</g>
+<g >
+<title>Trans_delegate::before_commit(THD*, bool, Binlog_cache_storage*, Binlog_cache_storage*, unsigned long long, bool) (1 samples, 0.39%)</title><rect x="1085.2" y="725" width="4.6" height="15.0" fill="rgb(104,214,214)" rx="2" ry="2" />
+<text  x="1088.21" y="735.5" ></text>
+</g>
+<g >
+<title>open_tables_for_query(THD*, TABLE_LIST*, unsigned int) (6 samples, 2.32%)</title><rect x="670.6" y="741" width="27.4" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="673.62" y="751.5" >o..</text>
+</g>
+<g >
+<title>poll_freewait (1 samples, 0.39%)</title><rect x="410.9" y="629" width="4.6" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="413.93" y="639.5" ></text>
+</g>
+<g >
+<title>ut_delay(unsigned long) (1 samples, 0.39%)</title><rect x="219.6" y="853" width="4.5" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="222.58" y="863.5" ></text>
+</g>
+<g >
+<title>net_send_ok(THD*, unsigned int, unsigned int, unsigned long long, unsigned long long, char const*, bool) (41 samples, 15.83%)</title><rect x="429.2" y="773" width="186.7" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="432.15" y="783.5" >net_send_ok(THD*, unsign..</text>
+</g>
+<g >
+<title>ip_protocol_deliver_rcu (15 samples, 5.79%)</title><rect x="483.8" y="197" width="68.4" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="486.82" y="207.5" >ip_prot..</text>
+</g>
+<g >
+<title>srv_purge_coordinator_thread() (1 samples, 0.39%)</title><rect x="215.0" y="853" width="4.6" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="218.02" y="863.5" ></text>
+</g>
+<g >
+<title>ext4_get_group_desc (1 samples, 0.39%)</title><rect x="953.1" y="405" width="4.5" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="956.09" y="415.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_reschedule_ipi (1 samples, 0.39%)</title><rect x="966.8" y="645" width="4.5" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="969.76" y="655.5" ></text>
+</g>
+<g >
+<title>do_poll.constprop.0 (1 samples, 0.39%)</title><rect x="401.8" y="613" width="4.6" height="15.0" fill="rgb(53,168,168)" rx="2" ry="2" />
+<text  x="404.81" y="623.5" ></text>
+</g>
+<g >
+<title>tcp_v4_do_rcv (13 samples, 5.02%)</title><rect x="492.9" y="165" width="59.3" height="15.0" fill="rgb(88,199,199)" rx="2" ry="2" />
+<text  x="495.93" y="175.5" >tcp_v4..</text>
+</g>
+<g >
+<title>_raw_spin_unlock_irqrestore (11 samples, 4.25%)</title><rect x="492.9" y="101" width="50.2" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="495.93" y="111.5" >_raw_..</text>
+</g>
+<g >
+<title>[unknown] (1 samples, 0.39%)</title><rect x="912.1" y="709" width="4.5" height="15.0" fill="rgb(90,201,201)" rx="2" ry="2" />
+<text  x="915.08" y="719.5" ></text>
+</g>
+<g >
+<title>Query_block::add_table_to_list(THD*, Table_ident*, char const*, unsigned long, thr_lock_type, enum_mdl_type, List&lt;Index_hint&gt;*, List&lt;String&gt;*, MYSQL_LEX_STRING*, Parse_context*) (2 samples, 0.77%)</title><rect x="1126.2" y="725" width="9.1" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="1129.22" y="735.5" ></text>
+</g>
+<g >
+<title>start_thread (192 samples, 74.13%)</title><rect x="315.3" y="885" width="874.7" height="15.0" fill="rgb(66,179,179)" rx="2" ry="2" />
+<text  x="318.25" y="895.5" >start_thread</text>
+</g>
+<g >
+<title>Item_decimal::Item_decimal(YYLTYPE const&amp;, char const*, unsigned int, CHARSET_INFO const*) (1 samples, 0.39%)</title><rect x="1144.4" y="741" width="4.6" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="1147.44" y="751.5" ></text>
+</g>
+<g >
+<title>ssl3_write_pending (29 samples, 11.20%)</title><rect x="465.6" y="629" width="132.1" height="15.0" fill="rgb(95,206,206)" rx="2" ry="2" />
+<text  x="468.60" y="639.5" >ssl3_write_pending</text>
+</g>
+<g >
+<title>syscall_enter_from_user_mode (1 samples, 0.39%)</title><rect x="151.2" y="821" width="4.6" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="154.24" y="831.5" ></text>
+</g>
+<g >
+<title>iowrite16 (4 samples, 1.54%)</title><rect x="183.1" y="293" width="18.3" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="186.13" y="303.5" ></text>
+</g>
+<g >
+<title>ssl_get_max_send_fragment (1 samples, 0.39%)</title><rect x="606.8" y="645" width="4.6" height="15.0" fill="rgb(68,182,182)" rx="2" ry="2" />
+<text  x="609.83" y="655.5" ></text>
+</g>
+<g >
+<title>all (259 samples, 100%)</title><rect x="10.0" y="917" width="1180.0" height="15.0" fill="rgb(102,212,212)" rx="2" ry="2" />
+<text  x="13.00" y="927.5" ></text>
+</g>
+<g >
+<title>PolicyMutex&lt;TTASEventMutex&lt;GenericPolicy&gt; &gt;::exit() (2 samples, 0.77%)</title><rect x="994.1" y="581" width="9.1" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="997.09" y="591.5" ></text>
+</g>
+<g >
+<title>trans_commit_stmt(THD*, bool) (1 samples, 0.39%)</title><rect x="1176.3" y="789" width="4.6" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="1179.33" y="799.5" ></text>
+</g>
+<g >
+<title>syscall_exit_to_user_mode (1 samples, 0.39%)</title><rect x="593.2" y="517" width="4.5" height="15.0" fill="rgb(84,197,197)" rx="2" ry="2" />
+<text  x="596.17" y="527.5" ></text>
+</g>
+<g >
+<title>__get_user_nocheck_1 (1 samples, 0.39%)</title><rect x="957.6" y="485" width="4.6" height="15.0" fill="rgb(80,192,192)" rx="2" ry="2" />
+<text  x="960.64" y="495.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;Detached_thread, void (*)(Clone_persist_gtid*), Clone_persist_gtid*&gt; &gt; &gt;::_M_run() (2 samples, 0.77%)</title><rect x="224.1" y="869" width="9.1" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="227.13" y="879.5" ></text>
+</g>
+<g >
+<title>new_sync_write (4 samples, 1.54%)</title><rect x="246.9" y="677" width="18.2" height="15.0" fill="rgb(93,204,204)" rx="2" ry="2" />
+<text  x="249.91" y="687.5" ></text>
+</g>
+<g >
+<title>generic_write_checks (1 samples, 0.39%)</title><rect x="246.9" y="629" width="4.6" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="249.91" y="639.5" ></text>
+</g>
+<g >
+<title>ssl3_write_bytes (37 samples, 14.29%)</title><rect x="442.8" y="661" width="168.6" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="445.82" y="671.5" >ssl3_write_bytes</text>
+</g>
+<g >
+<title>mtr_t::Command::execute() (1 samples, 0.39%)</title><rect x="821.0" y="613" width="4.5" height="15.0" fill="rgb(109,219,219)" rx="2" ry="2" />
+<text  x="823.97" y="623.5" ></text>
+</g>
+<g >
+<title>check_single_table_access(THD*, unsigned long, TABLE_LIST*, bool) (1 samples, 0.39%)</title><rect x="661.5" y="725" width="4.6" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="664.51" y="735.5" ></text>
+</g>
+<g >
+<title>ip_finish_output2 (18 samples, 6.95%)</title><rect x="474.7" y="341" width="82.0" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="477.71" y="351.5" >ip_finish..</text>
+</g>
+<g >
+<title>fil_addr_is_null(fil_addr_t const&amp;) (1 samples, 0.39%)</title><rect x="1021.4" y="533" width="4.6" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="1024.43" y="543.5" ></text>
+</g>
+<g >
+<title>thd_sql_command (1 samples, 0.39%)</title><rect x="843.7" y="709" width="4.6" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="846.75" y="719.5" ></text>
+</g>
+<g >
+<title>tcp_sendmsg (25 samples, 9.65%)</title><rect x="470.2" y="437" width="113.9" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="473.15" y="447.5" >tcp_sendmsg</text>
+</g>
+<g >
+<title>syscall_exit_to_user_mode (1 samples, 0.39%)</title><rect x="265.1" y="709" width="4.6" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="268.14" y="719.5" ></text>
+</g>
+<g >
+<title>virtio_queue_rq (4 samples, 1.54%)</title><rect x="183.1" y="357" width="18.3" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="186.13" y="367.5" ></text>
+</g>
+<g >
+<title>ksys_read (5 samples, 1.93%)</title><rect x="356.3" y="517" width="22.7" height="15.0" fill="rgb(104,214,214)" rx="2" ry="2" />
+<text  x="359.25" y="527.5" >k..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (5 samples, 1.93%)</title><rect x="246.9" y="741" width="22.8" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="249.91" y="751.5" >e..</text>
+</g>
+<g >
+<title>tcp_v4_rcv (15 samples, 5.79%)</title><rect x="483.8" y="181" width="68.4" height="15.0" fill="rgb(107,218,218)" rx="2" ry="2" />
+<text  x="486.82" y="191.5" >tcp_v4_..</text>
+</g>
+<g >
+<title>mlog_write_string(unsigned char*, unsigned char const*, unsigned long, mtr_t*) (1 samples, 0.39%)</title><rect x="1089.8" y="677" width="4.5" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="1092.77" y="687.5" ></text>
+</g>
+<g >
+<title>__write (29 samples, 11.20%)</title><rect x="465.6" y="565" width="132.1" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="468.60" y="575.5" >__write</text>
+</g>
+<g >
+<title>blk_mq_dispatch_rq_list (4 samples, 1.54%)</title><rect x="183.1" y="373" width="18.3" height="15.0" fill="rgb(81,194,194)" rx="2" ry="2" />
+<text  x="186.13" y="383.5" ></text>
+</g>
+<g >
+<title>bio_write_intern (29 samples, 11.20%)</title><rect x="465.6" y="597" width="132.1" height="15.0" fill="rgb(86,198,198)" rx="2" ry="2" />
+<text  x="468.60" y="607.5" >bio_write_intern</text>
+</g>
+<g >
+<title>iowrite16 (4 samples, 1.54%)</title><rect x="183.1" y="309" width="18.3" height="15.0" fill="rgb(92,204,204)" rx="2" ry="2" />
+<text  x="186.13" y="319.5" ></text>
+</g>
+<g >
+<title>lock_trx_release_locks(trx_t*) (1 samples, 0.39%)</title><rect x="1003.2" y="581" width="4.6" height="15.0" fill="rgb(69,182,182)" rx="2" ry="2" />
+<text  x="1006.20" y="591.5" ></text>
+</g>
+<g >
+<title>finish_task_switch.isra.0 (1 samples, 0.39%)</title><rect x="406.4" y="565" width="4.5" height="15.0" fill="rgb(53,167,167)" rx="2" ry="2" />
+<text  x="409.37" y="575.5" ></text>
+</g>
+<g >
+<title>handler::ha_external_lock(THD*, int) (1 samples, 0.39%)</title><rect x="843.7" y="725" width="4.6" height="15.0" fill="rgb(70,183,183)" rx="2" ry="2" />
+<text  x="846.75" y="735.5" ></text>
+</g>
+<g >
+<title>fill_record(THD*, TABLE*, mem_root_deque&lt;Item*&gt; const&amp;, mem_root_deque&lt;Item*&gt; const&amp;, MY_BITMAP*, MY_BITMAP*, bool) (3 samples, 1.16%)</title><rect x="707.1" y="725" width="13.6" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="710.07" y="735.5" ></text>
+</g>
+<g >
+<title>find_field_in_table_ref(THD*, TABLE_LIST*, char const*, unsigned long, char const*, char const*, char const*, Item**, unsigned long, bool, unsigned int*, bool, TABLE_LIST**) [clone .localalias.550] (1 samples, 0.39%)</title><rect x="656.9" y="661" width="4.6" height="15.0" fill="rgb(61,175,175)" rx="2" ry="2" />
+<text  x="659.95" y="671.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (1 samples, 0.39%)</title><rect x="310.7" y="789" width="4.6" height="15.0" fill="rgb(56,170,170)" rx="2" ry="2" />
+<text  x="313.69" y="799.5" ></text>
+</g>
+<g >
+<title>__blk_mq_do_dispatch_sched (4 samples, 1.54%)</title><rect x="183.1" y="389" width="18.3" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="186.13" y="399.5" ></text>
+</g>
+<g >
+<title>finish_task_switch.isra.0 (1 samples, 0.39%)</title><rect x="593.2" y="437" width="4.5" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="596.17" y="447.5" ></text>
+</g>
+<g >
+<title>sock_sendmsg (25 samples, 9.65%)</title><rect x="470.2" y="453" width="113.9" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="473.15" y="463.5" >sock_sendmsg</text>
+</g>
+<g >
+<title>netif_rx (1 samples, 0.39%)</title><rect x="479.3" y="277" width="4.5" height="15.0" fill="rgb(68,181,181)" rx="2" ry="2" />
+<text  x="482.27" y="287.5" ></text>
+</g>
+<g >
+<title>schedule (1 samples, 0.39%)</title><rect x="593.2" y="469" width="4.5" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="596.17" y="479.5" ></text>
+</g>
+<g >
+<title>Fil_shard::flush_file_spaces(unsigned char) (4 samples, 1.54%)</title><rect x="274.2" y="773" width="18.3" height="15.0" fill="rgb(87,198,198)" rx="2" ry="2" />
+<text  x="277.25" y="783.5" ></text>
+</g>
+<g >
+<title>Gtid_set::add_gtid_text(char const*, bool*, bool*) (1 samples, 0.39%)</title><rect x="224.1" y="805" width="4.6" height="15.0" fill="rgb(108,218,218)" rx="2" ry="2" />
+<text  x="227.13" y="815.5" ></text>
+</g>
+<g >
+<title>btr_cur_pessimistic_insert(unsigned int, btr_cur_t*, unsigned long**, mem_block_info_t**, dtuple_t*, unsigned char**, big_rec_t**, que_thr_t*, mtr_t*) (1 samples, 0.39%)</title><rect x="789.1" y="629" width="4.5" height="15.0" fill="rgb(60,174,174)" rx="2" ry="2" />
+<text  x="792.07" y="639.5" ></text>
+</g>
+<g >
+<title>fput_many (1 samples, 0.39%)</title><rect x="410.9" y="597" width="4.6" height="15.0" fill="rgb(68,182,182)" rx="2" ry="2" />
+<text  x="413.93" y="607.5" ></text>
+</g>
+<g >
+<title>sock_recvmsg (1 samples, 0.39%)</title><rect x="374.5" y="453" width="4.5" height="15.0" fill="rgb(90,201,201)" rx="2" ry="2" />
+<text  x="377.48" y="463.5" ></text>
+</g>
+<g >
+<title>binary_log::Uuid::to_string(unsigned char const*, char*) (1 samples, 0.39%)</title><rect x="1071.5" y="613" width="4.6" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="1074.54" y="623.5" ></text>
+</g>
+<g >
+<title>btr_estimate_number_of_different_key_vals(dict_index_t*) (1 samples, 0.39%)</title><rect x="228.7" y="677" width="4.5" height="15.0" fill="rgb(77,190,190)" rx="2" ry="2" />
+<text  x="231.69" y="687.5" ></text>
+</g>
+<g >
+<title>trx_undo_gtid_add_update_undo(trx_t*, bool, bool) (5 samples, 1.93%)</title><rect x="1039.7" y="629" width="22.7" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="1042.65" y="639.5" >t..</text>
+</g>
+<g >
+<title>DML_prelocking_strategy::handle_table(THD*, Query_tables_list*, TABLE_LIST*, bool*) (2 samples, 0.77%)</title><rect x="675.2" y="709" width="9.1" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="678.17" y="719.5" ></text>
+</g>
+<g >
+<title>fil_io(IORequest const&amp;, bool, page_id_t const&amp;, page_size_t const&amp;, unsigned long, unsigned long, void*, void*) (2 samples, 0.77%)</title><rect x="205.9" y="709" width="9.1" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="208.91" y="719.5" ></text>
+</g>
+<g >
+<title>PT_insert::make_cmd(THD*) (4 samples, 1.54%)</title><rect x="1117.1" y="741" width="18.2" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="1120.10" y="751.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (9 samples, 3.47%)</title><rect x="114.8" y="869" width="41.0" height="15.0" fill="rgb(71,185,185)" rx="2" ry="2" />
+<text  x="117.79" y="879.5" >ent..</text>
+</g>
+<g >
+<title>ssl3_read_bytes (16 samples, 6.18%)</title><rect x="324.4" y="661" width="72.9" height="15.0" fill="rgb(87,198,198)" rx="2" ry="2" />
+<text  x="327.36" y="671.5" >ssl3_rea..</text>
+</g>
+<g >
+<title>__x64_sys_ppoll (4 samples, 1.54%)</title><rect x="397.3" y="661" width="18.2" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="400.26" y="671.5" ></text>
+</g>
+<g >
+<title>syscall (2 samples, 0.77%)</title><rect x="975.9" y="645" width="9.1" height="15.0" fill="rgb(103,213,213)" rx="2" ry="2" />
+<text  x="978.87" y="655.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4 samples, 1.54%)</title><rect x="397.3" y="693" width="18.2" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="400.26" y="703.5" ></text>
+</g>
+<g >
+<title>kvm_clock_get_cycles (1 samples, 0.39%)</title><rect x="369.9" y="341" width="4.6" height="15.0" fill="rgb(102,213,213)" rx="2" ry="2" />
+<text  x="372.92" y="351.5" ></text>
+</g>
+<g >
+<title>ip_local_deliver_finish (15 samples, 5.79%)</title><rect x="483.8" y="213" width="68.4" height="15.0" fill="rgb(81,193,193)" rx="2" ry="2" />
+<text  x="486.82" y="223.5" >ip_loca..</text>
+</g>
+<g >
+<title>innobase_commit(handlerton*, THD*, bool) (19 samples, 7.34%)</title><rect x="975.9" y="677" width="86.5" height="15.0" fill="rgb(64,177,177)" rx="2" ry="2" />
+<text  x="978.87" y="687.5" >innobase_c..</text>
+</g>
+<g >
+<title>wpacket_intern_close (2 samples, 0.77%)</title><rect x="383.6" y="597" width="9.1" height="15.0" fill="rgb(94,205,205)" rx="2" ry="2" />
+<text  x="386.59" y="607.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::assign_automatic_gtids_to_flush_group(THD*) (1 samples, 0.39%)</title><rect x="1062.4" y="693" width="4.6" height="15.0" fill="rgb(75,188,188)" rx="2" ry="2" />
+<text  x="1065.43" y="703.5" ></text>
+</g>
+<g >
+<title>finish_task_switch.isra.0 (3 samples, 1.16%)</title><rect x="164.9" y="741" width="13.7" height="15.0" fill="rgb(59,174,174)" rx="2" ry="2" />
+<text  x="167.90" y="751.5" ></text>
+</g>
+<g >
+<title>plugin_foreach_with_mask(THD*, bool (*)(THD*, st_plugin_int*, void*), int, unsigned int, void*) (1 samples, 0.39%)</title><rect x="962.2" y="677" width="4.6" height="15.0" fill="rgb(105,215,215)" rx="2" ry="2" />
+<text  x="965.20" y="687.5" ></text>
+</g>
+<g >
+<title>ssl_write_internal (38 samples, 14.67%)</title><rect x="438.3" y="693" width="173.1" height="15.0" fill="rgb(87,199,199)" rx="2" ry="2" />
+<text  x="441.26" y="703.5" >ssl_write_internal</text>
+</g>
+<g >
+<title>__tcp_push_pending_frames (22 samples, 8.49%)</title><rect x="470.2" y="405" width="100.2" height="15.0" fill="rgb(62,176,176)" rx="2" ry="2" />
+<text  x="473.15" y="415.5" >__tcp_push_p..</text>
+</g>
+<g >
+<title>mtr_t::Command::add_dirty_blocks_to_flush_list(unsigned long, unsigned long) (1 samples, 0.39%)</title><rect x="821.0" y="597" width="4.5" height="15.0" fill="rgb(57,172,172)" rx="2" ry="2" />
+<text  x="823.97" y="607.5" ></text>
+</g>
+<g >
+<title>Buf_fetch&lt;Buf_fetch_normal&gt;::single_page() (3 samples, 1.16%)</title><rect x="770.8" y="565" width="13.7" height="15.0" fill="rgb(100,211,211)" rx="2" ry="2" />
+<text  x="773.85" y="575.5" ></text>
+</g>
+<g >
+<title>close_thread_table(THD*, TABLE**) (1 samples, 0.39%)</title><rect x="862.0" y="757" width="4.5" height="15.0" fill="rgb(64,178,178)" rx="2" ry="2" />
+<text  x="864.97" y="767.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::flush_cache_to_file(unsigned long long*) (10 samples, 3.86%)</title><rect x="916.6" y="709" width="45.6" height="15.0" fill="rgb(65,178,178)" rx="2" ry="2" />
+<text  x="919.64" y="719.5" >MYSQ..</text>
+</g>
+<g >
+<title>__local_bh_enable_ip (16 samples, 6.18%)</title><rect x="483.8" y="325" width="72.9" height="15.0" fill="rgb(76,189,189)" rx="2" ry="2" />
+<text  x="486.82" y="335.5" >__local_..</text>
+</g>
+<g >
+<title>netif_rx_internal (1 samples, 0.39%)</title><rect x="479.3" y="261" width="4.5" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="482.27" y="271.5" ></text>
+</g>
+<g >
+<title>syscall_trace_enter.constprop.0 (1 samples, 0.39%)</title><rect x="210.5" y="597" width="4.5" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="213.46" y="607.5" ></text>
+</g>
+<g >
+<title>__block_write_begin_int (1 samples, 0.39%)</title><rect x="934.9" y="501" width="4.5" height="15.0" fill="rgb(99,210,210)" rx="2" ry="2" />
+<text  x="937.86" y="511.5" ></text>
+</g>
+<g >
+<title>generic_write_end (2 samples, 0.77%)</title><rect x="948.5" y="517" width="9.1" height="15.0" fill="rgb(50,165,165)" rx="2" ry="2" />
+<text  x="951.53" y="527.5" ></text>
+</g>
+<g >
+<title>EVP_MD_CTX_md (1 samples, 0.39%)</title><rect x="324.4" y="645" width="4.5" height="15.0" fill="rgb(103,214,214)" rx="2" ry="2" />
+<text  x="327.36" y="655.5" ></text>
+</g>
+<g >
+<title>ssl3_write (38 samples, 14.67%)</title><rect x="438.3" y="677" width="173.1" height="15.0" fill="rgb(58,172,172)" rx="2" ry="2" />
+<text  x="441.26" y="687.5" >ssl3_write</text>
+</g>
+<g >
+<title>THD::binlog_write_row(TABLE*, bool, unsigned char const*, unsigned char const*) (1 samples, 0.39%)</title><rect x="748.1" y="677" width="4.5" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="751.07" y="687.5" ></text>
+</g>
+<g >
+<title>btr_search_update_hash_on_insert(btr_cur_t*) (1 samples, 0.39%)</title><rect x="816.4" y="629" width="4.6" height="15.0" fill="rgb(66,180,180)" rx="2" ry="2" />
+<text  x="819.41" y="639.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (4 samples, 1.54%)</title><rect x="397.3" y="677" width="18.2" height="15.0" fill="rgb(51,166,166)" rx="2" ry="2" />
+<text  x="400.26" y="687.5" ></text>
+</g>
+<g >
+<title>ext4_inode_csum (1 samples, 0.39%)</title><rect x="925.8" y="389" width="4.5" height="15.0" fill="rgb(107,217,217)" rx="2" ry="2" />
+<text  x="928.75" y="399.5" ></text>
+</g>
+<g >
+<title>ext4_da_write_begin (3 samples, 1.16%)</title><rect x="934.9" y="517" width="13.6" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="937.86" y="527.5" ></text>
+</g>
+<g >
+<title>buf_page_get_gen(page_id_t const&amp;, page_size_t const&amp;, unsigned long, buf_block_t*, Page_fetch, ut::Location, mtr_t*, bool) (1 samples, 0.39%)</title><rect x="1007.8" y="565" width="4.5" height="15.0" fill="rgb(74,187,187)" rx="2" ry="2" />
+<text  x="1010.76" y="575.5" ></text>
+</g>
+<g >
+<title>Fil_shard::do_redo_io(IORequest const&amp;, page_id_t const&amp;, page_size_t const&amp;, unsigned long, unsigned long, void*) (6 samples, 2.32%)</title><rect x="242.4" y="805" width="27.3" height="15.0" fill="rgb(73,186,186)" rx="2" ry="2" />
+<text  x="245.36" y="815.5" >F..</text>
+</g>
+<g >
+<title>net_rx_action (15 samples, 5.79%)</title><rect x="483.8" y="277" width="68.4" height="15.0" fill="rgb(101,212,212)" rx="2" ry="2" />
+<text  x="486.82" y="287.5" >net_rx_..</text>
+</g>
+<g >
+<title>io_handler_thread(unsigned long) (9 samples, 3.47%)</title><rect x="274.2" y="853" width="41.1" height="15.0" fill="rgb(84,196,196)" rx="2" ry="2" />
+<text  x="277.25" y="863.5" >io_..</text>
+</g>
+<g >
+<title>ext4_da_get_block_prep (1 samples, 0.39%)</title><rect x="934.9" y="485" width="4.5" height="15.0" fill="rgb(85,197,197)" rx="2" ry="2" />
+<text  x="937.86" y="495.5" ></text>
+</g>
+<g >
+<title>Gtid_state::update_gtids_impl_own_gtid(THD*, bool) (1 samples, 0.39%)</title><rect x="966.8" y="677" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="969.76" y="687.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;Detached_thread, void (*)(log_t*), log_t*&gt; &gt; &gt;::_M_run() (9 samples, 3.47%)</title><rect x="233.2" y="869" width="41.0" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="236.24" y="879.5" >std..</text>
+</g>
+<g >
+<title>do_syscall_64 (2 samples, 0.77%)</title><rect x="278.8" y="709" width="9.1" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="281.80" y="719.5" ></text>
+</g>
+<g >
+<title>dblwr::write_complete(buf_page_t*, buf_flush_t) (1 samples, 0.39%)</title><rect x="292.5" y="821" width="4.5" height="15.0" fill="rgb(63,177,177)" rx="2" ry="2" />
+<text  x="295.47" y="831.5" ></text>
+</g>
+<g >
+<title>stop_this_handle (1 samples, 0.39%)</title><rect x="916.6" y="453" width="4.6" height="15.0" fill="rgb(69,183,183)" rx="2" ry="2" />
+<text  x="919.64" y="463.5" ></text>
+</g>
+<g >
+<title>__ext4_get_inode_loc (1 samples, 0.39%)</title><rect x="953.1" y="421" width="4.5" height="15.0" fill="rgb(96,207,207)" rx="2" ry="2" />
+<text  x="956.09" y="431.5" ></text>
+</g>
+<g >
+<title>ext4_map_blocks (1 samples, 0.39%)</title><rect x="32.8" y="757" width="4.5" height="15.0" fill="rgb(67,180,180)" rx="2" ry="2" />
+<text  x="35.78" y="767.5" ></text>
+</g>
+<g >
+<title>IO_CACHE_binlog_cache_storage::length() const (1 samples, 0.39%)</title><rect x="834.6" y="725" width="4.6" height="15.0" fill="rgb(78,191,191)" rx="2" ry="2" />
+<text  x="837.63" y="735.5" ></text>
+</g>
+<g >
+<title>Gtid_state::update_gtids_impl_do_nothing(THD*) (1 samples, 0.39%)</title><rect x="971.3" y="693" width="4.6" height="15.0" fill="rgb(57,171,171)" rx="2" ry="2" />
+<text  x="974.31" y="703.5" ></text>
+</g>
+<g >
+<title>MYSQL_BIN_LOG::commit(THD*, bool) (38 samples, 14.67%)</title><rect x="916.6" y="741" width="173.2" height="15.0" fill="rgb(71,184,184)" rx="2" ry="2" />
+<text  x="919.64" y="751.5" >MYSQL_BIN_LOG::commit(..</text>
+</g>
+<g >
+<title>vfs_write (26 samples, 10.04%)</title><rect x="470.2" y="501" width="118.4" height="15.0" fill="rgb(80,192,192)" rx="2" ry="2" />
+<text  x="473.15" y="511.5" >vfs_write</text>
+</g>
+<g >
+<title>exit_to_user_mode_loop (1 samples, 0.39%)</title><rect x="593.2" y="485" width="4.5" height="15.0" fill="rgb(91,203,203)" rx="2" ry="2" />
+<text  x="596.17" y="495.5" ></text>
+</g>
+<g >
+<title>__ext4_journal_start_sb (1 samples, 0.39%)</title><rect x="256.0" y="581" width="4.6" height="15.0" fill="rgb(59,173,173)" rx="2" ry="2" />
+<text  x="259.02" y="591.5" ></text>
+</g>
+<g >
+<title>ext4_nonda_switch (1 samples, 0.39%)</title><rect x="939.4" y="501" width="4.6" height="15.0" fill="rgb(104,215,215)" rx="2" ry="2" />
+<text  x="942.42" y="511.5" ></text>
+</g>
+<g >
+<title>EVP_CIPHER_CTX_iv_length (1 samples, 0.39%)</title><rect x="456.5" y="629" width="4.5" height="15.0" fill="rgb(106,216,216)" rx="2" ry="2" />
+<text  x="459.49" y="639.5" ></text>
+</g>
+<g >
+<title>ext4_nonda_switch (1 samples, 0.39%)</title><rect x="939.4" y="485" width="4.6" height="15.0" fill="rgb(97,208,208)" rx="2" ry="2" />
+<text  x="942.42" y="495.5" ></text>
+</g>
+</g>
+</svg>
